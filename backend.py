@@ -206,27 +206,36 @@ def get_teacher_email(teacher: str) -> str:
     return book.get(_norm_key(teacher), st.secrets.get("ADMIN_EMAIL", ""))
 
 def _smtp_send(to_addr: str, subject: str, body: str) -> None:
-    """Send a single email with timeout, TLS by default (non-blocking wrapper uses thread)."""
     if not to_addr:
         return
-    host = st.secrets.get("EMAIL_HOST", "smtp.gmail.com")
-    port = int(st.secrets.get("EMAIL_PORT", 587))
-    user = st.secrets.get("EMAIL_USER", "")
-    pwd  = st.secrets.get("EMAIL_PASS", "")
-    use_tls = str(st.secrets.get("EMAIL_USE_TLS", "true")).lower() == "true"
+    try:
+        host = st.secrets.get("EMAIL_HOST", "smtp.gmail.com")
+        port = int(st.secrets.get("EMAIL_PORT", 587))
+        user = st.secrets.get("EMAIL_USER", "")
+        pwd  = st.secrets.get("EMAIL_PASS", "")
+        use_tls = str(st.secrets.get("EMAIL_USE_TLS", "true")).lower() == "true"
 
-    msg = f"Subject: {subject}\r\nFrom: {user}\r\nTo: {to_addr}\r\n\r\n{body}"
-    if use_tls:
-        with smtplib.SMTP(host, port, timeout=8) as s:
-            s.starttls(context=ssl.create_default_context())
-            s.login(user, pwd)
-            s.sendmail(user, [to_addr], msg)
-    else:
-        with smtplib.SMTP_SSL(host, port, timeout=8) as s:
-            s.login(user, pwd)
-            s.sendmail(user, [to_addr], msg)
+        if not (host and port and user and pwd):
+            st.warning("Email secrets incomplete; skipping send.")
+            return
 
-def _send_async(to_addr: str, subject: str, body: str) -> None:
+        msg = f"Subject: {subject}\r\nFrom: {user}\r\nTo: {to_addr}\r\n\r\n{body}"
+
+        if use_tls:
+            with smtplib.SMTP(host, port, timeout=12) as s:
+                s.starttls(context=ssl.create_default_context())
+                s.login(user, pwd)
+                s.sendmail(user, [to_addr], msg)
+        else:
+            with smtplib.SMTP_SSL(host, port, timeout=12) as s:
+                s.login(user, pwd)
+                s.sendmail(user, [to_addr], msg)
+    except Exception as e:
+        # Surface in app logs without crashing the UI
+        try:
+            st.warning(f"Email send failed to {to_addr}: {e}")
+        except Exception:
+            passdef _send_async(to_addr: str, subject: str, body: str) -> None:
     threading.Thread(target=_smtp_send, args=(to_addr, subject, body), daemon=True).start()
 
 
@@ -357,3 +366,4 @@ def send_cancellation_emails(booking: Dict[str, Any]) -> None:
             f"Grade: {grade}\n"
         ),
     )
+
