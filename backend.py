@@ -1,19 +1,20 @@
-# backend.py  — final version
+# backend.py — FINAL
 
 from __future__ import annotations
 import sqlite3
 from datetime import datetime
+from typing import Optional, Dict, Any, List
 import threading
 import smtplib
 import ssl
-from typing import Optional, Dict, Any, List
+import re
 
 import streamlit as st
 
 from init_db import initialize_database
 from teacher_mapping import candidates_for_subject
 
-# Ensure DB schema exists
+# Ensure schema exists once at import
 initialize_database()
 
 DB_PATH = "cordova_publication.db"
@@ -31,7 +32,6 @@ def get_conn() -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
-
 def _exec(query: str, args: tuple = ()) -> sqlite3.Cursor:
     cur = get_conn().cursor()
     cur.execute(query, args)
@@ -42,7 +42,7 @@ def _exec(query: str, args: tuple = ()) -> sqlite3.Cursor:
 # Availability & Assignment
 # =========================
 def is_teacher_unavailable(teacher: str, date: str, slot: str) -> bool:
-    """True if teacher is unavailable for the day OR for the specific slot."""
+    """True if teacher is unavailable for the day OR the specific slot."""
     cur = _exec(
         """
         SELECT COUNT(*) FROM teacher_unavailability
@@ -59,6 +59,21 @@ def pick_teacher(subject: str, date: str, slot: str) -> Optional[str]:
         if not is_teacher_unavailable(t, date, slot):
             return t
     return None
+
+
+# =========================
+# Duplicate Guard
+# =========================
+def exists_booking(school: str, subject: str, day: str, slot: str) -> bool:
+    """Soft check to prevent duplicate key (School+Subject+Date+Slot)."""
+    cur = _exec(
+        """
+        SELECT 1 FROM bookings
+        WHERE school_name=? AND subject=? AND date=? AND slot=? LIMIT 1
+        """,
+        (school, subject, day, slot),
+    )
+    return cur.fetchone() is not None
 
 
 # =========================
@@ -156,14 +171,10 @@ def mark_unavailable(teacher: str, date: str, slot: Optional[str]) -> None:
     )
     get_conn().commit()
 
-
 def list_unavailability() -> List[Dict[str, Any]]:
-    cur = _exec(
-        "SELECT id, teacher, date, slot FROM teacher_unavailability ORDER BY date DESC"
-    )
+    cur = _exec("SELECT id, teacher, date, slot FROM teacher_unavailability ORDER BY date DESC")
     cols = ["id", "Teacher", "Date", "Slot"]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
-
 
 def delete_unavailability(unavail_id: int) -> None:
     _exec("DELETE FROM teacher_unavailability WHERE id=?", (unavail_id,))
@@ -173,28 +184,35 @@ def delete_unavailability(unavail_id: int) -> None:
 # =========================
 # Email Utilities (non-blocking)
 # =========================
-def _norm_teacher_key(name: str) -> str:
-    return (name or "").upper().replace(" ", "")
-
+def _norm_key(name: str) -> str:
+    """
+    Normalize teacher display name to TOML key:
+      - uppercase
+      - non-alphanumerics -> underscore
+      Example: "Kalpana Ma'am" -> "KALPANA_MAAM"
+    """
+    name = (name or "").upper()
+    name = re.sub(r"[^A-Z0-9]+", "_", name).strip("_")
+    return name
 
 def get_teacher_email(teacher: str) -> str:
     """
     Map teacher display name to email using secrets:
-      TEACHER_EMAILS = { "BHARTIMA'AM" = "bharti@...", "VIVEKSIR" = "..." }
+      [TEACHER_EMAILS]
+      KALPANA_MAAM = "kalpana@..."
     Falls back to ADMIN_EMAIL if not found.
     """
     book = st.secrets.get("TEACHER_EMAILS", {})
-    return book.get(_norm_teacher_key(teacher), st.secrets.get("ADMIN_EMAIL", ""))
-
+    return book.get(_norm_key(teacher), st.secrets.get("ADMIN_EMAIL", ""))
 
 def _smtp_send(to_addr: str, subject: str, body: str) -> None:
-    """Send a single email with timeout, TLS by default."""
+    """Send a single email with timeout, TLS by default (non-blocking wrapper uses thread)."""
     if not to_addr:
         return
     host = st.secrets.get("EMAIL_HOST", "smtp.gmail.com")
     port = int(st.secrets.get("EMAIL_PORT", 587))
     user = st.secrets.get("EMAIL_USER", "")
-    pwd = st.secrets.get("EMAIL_PASS", "")
+    pwd  = st.secrets.get("EMAIL_PASS", "")
     use_tls = str(st.secrets.get("EMAIL_USE_TLS", "true")).lower() == "true"
 
     msg = f"Subject: {subject}\r\nFrom: {user}\r\nTo: {to_addr}\r\n\r\n{body}"
@@ -207,7 +225,6 @@ def _smtp_send(to_addr: str, subject: str, body: str) -> None:
         with smtplib.SMTP_SSL(host, port, timeout=8) as s:
             s.login(user, pwd)
             s.sendmail(user, [to_addr], msg)
-
 
 def _send_async(to_addr: str, subject: str, body: str) -> None:
     threading.Thread(target=_smtp_send, args=(to_addr, subject, body), daemon=True).start()
@@ -222,22 +239,21 @@ def send_confirmation_emails(booking: Dict[str, Any]) -> None:
       - Salesperson (confirmation, no teacher personal details)
       - Teacher (assignment, no salesperson details)
       - Admin (summary)
-    booking dict keys accepted: either DB-style caps or form keys.
+    Accepts either DB-style keys (Title Case) or form keys (snake/camel).
     """
-    # Normalize accessors
-    def g(key_caps: str, key_form: str) -> Any:
-        return booking.get(key_caps) if key_caps in booking else booking.get(key_form)
+    def g(CAPS: str, form: str) -> Any:
+        return booking.get(CAPS) if CAPS in booking else booking.get(form)
 
     sp_email = g("Salesperson Email", "salesperson_email")
-    sp_name = g("Salesperson", "salesperson_name")
-    school = g("School", "school_name")
-    grade = g("Grade", "grade")
-    subject = g("Subject", "subject")
-    day = g("Date", "date")
-    slot = g("Slot", "slot")
-    btype = g("Type", "booking_type")
-    topic = g("Topic", "topic") or "N/A"
-    teacher = g("Teacher", "teacher")
+    sp_name  = g("Salesperson", "salesperson_name")
+    school   = g("School", "school_name")
+    grade    = g("Grade", "grade")
+    subj     = g("Subject", "subject")
+    day      = g("Date", "date")
+    slot     = g("Slot", "slot")
+    btype    = g("Type", "booking_type")
+    topic    = g("Topic", "topic") or "N/A"
+    teacher  = g("Teacher", "teacher")
     admin_to = st.secrets.get("ADMIN_EMAIL", "")
 
     # Salesperson
@@ -249,7 +265,7 @@ def send_confirmation_emails(booking: Dict[str, Any]) -> None:
             "Your class has been successfully booked.\n\n"
             f"School: {school}\n"
             f"Grade: {grade}\n"
-            f"Subject: {subject}\n"
+            f"Subject: {subj}\n"
             f"Date: {day}\n"
             f"Slot: {slot}\n"
             f"Type: {btype}\n"
@@ -264,7 +280,7 @@ def send_confirmation_emails(booking: Dict[str, Any]) -> None:
         "✅ New Cordova Session Assigned",
         (
             "You have a new session to conduct.\n\n"
-            f"Subject: {subject}\n"
+            f"Subject: {subj}\n"
             f"Date: {day}\n"
             f"Slot: {slot}\n"
             f"School: {school}\n"
@@ -274,7 +290,7 @@ def send_confirmation_emails(booking: Dict[str, Any]) -> None:
         ),
     )
 
-    # Admin
+    # Admin summary
     _send_async(
         admin_to,
         "📢 New Cordova Booking Created",
@@ -282,7 +298,7 @@ def send_confirmation_emails(booking: Dict[str, Any]) -> None:
             "A new booking has been created:\n\n"
             f"School: {school}\n"
             f"Grade: {grade}\n"
-            f"Subject: {subject}\n"
+            f"Subject: {subj}\n"
             f"Date: {day}\n"
             f"Slot: {slot}\n"
             f"Type: {btype}\n"
@@ -293,25 +309,24 @@ def send_confirmation_emails(booking: Dict[str, Any]) -> None:
         ),
     )
 
-
 def send_cancellation_emails(booking: Dict[str, Any]) -> None:
     """
     Trigger cancellation emails (non-blocking) to:
       - Salesperson
       - Teacher
-    Accepts the row dict used in Admin dashboard.
+    Accepts the row dict used in Admin dashboard or the original form dict.
     """
-    def g(key_caps: str, key_form: str) -> Any:
-        return booking.get(key_caps) if key_caps in booking else booking.get(key_form)
+    def g(CAPS: str, form: str) -> Any:
+        return booking.get(CAPS) if CAPS in booking else booking.get(form)
 
     sp_email = g("Salesperson Email", "salesperson_email")
-    sp_name = g("Salesperson", "salesperson_name")
-    school = g("School", "school_name")
-    grade = g("Grade", "grade")
-    subject = g("Subject", "subject")
-    day = g("Date", "date")
-    slot = g("Slot", "slot")
-    teacher = g("Teacher", "teacher")
+    sp_name  = g("Salesperson", "salesperson_name")
+    school   = g("School", "school_name")
+    grade    = g("Grade", "grade")
+    subj     = g("Subject", "subject")
+    day      = g("Date", "date")
+    slot     = g("Slot", "slot")
+    teacher  = g("Teacher", "teacher")
 
     # Salesperson
     _send_async(
@@ -322,7 +337,7 @@ def send_cancellation_emails(booking: Dict[str, Any]) -> None:
             "Your scheduled class has been cancelled.\n\n"
             f"School: {school}\n"
             f"Grade: {grade}\n"
-            f"Subject: {subject}\n"
+            f"Subject: {subj}\n"
             f"Date: {day}\n"
             f"Slot: {slot}\n"
         ),
@@ -335,7 +350,7 @@ def send_cancellation_emails(booking: Dict[str, Any]) -> None:
         "❌ Cordova Session Cancelled",
         (
             "Your assigned session has been cancelled.\n\n"
-            f"Subject: {subject}\n"
+            f"Subject: {subj}\n"
             f"Date: {day}\n"
             f"Slot: {slot}\n"
             f"School: {school}\n"
