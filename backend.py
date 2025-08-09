@@ -184,26 +184,9 @@ def delete_unavailability(unavail_id: int) -> None:
 # =========================
 # Email Utilities (non-blocking)
 # =========================
-def _norm_key(name: str) -> str:
-    """
-    Normalize teacher display name to TOML key:
-      - uppercase
-      - non-alphanumerics -> underscore
-      Example: "Kalpana Ma'am" -> "KALPANA_MAAM"
-    """
-    name = (name or "").upper()
-    name = re.sub(r"[^A-Z0-9]+", "_", name).strip("_")
-    return name
-
-def get_teacher_email(teacher: str) -> str:
-    """
-    Map teacher display name to email using secrets:
-      [TEACHER_EMAILS]
-      KALPANA_MAAM = "kalpana@..."
-    Falls back to ADMIN_EMAIL if not found.
-    """
-    book = st.secrets.get("TEACHER_EMAILS", {})
-    return book.get(_norm_key(teacher), st.secrets.get("ADMIN_EMAIL", ""))
+# mapping lookup
+book = st.secrets.get("TEACHER_EMAILS", {})
+return book.get(_norm_key(teacher), st.secrets.get("ADMIN_EMAIL", ""))
 
 def _smtp_send(to_addr: str, subject: str, body: str) -> None:
     if not to_addr:
@@ -222,12 +205,15 @@ def _smtp_send(to_addr: str, subject: str, body: str) -> None:
         msg = f"Subject: {subject}\r\nFrom: {user}\r\nTo: {to_addr}\r\n\r\n{body}"
 
         if use_tls:
+            # TLS on port 587 (default)
             with smtplib.SMTP(host, port, timeout=12) as s:
                 s.starttls(context=ssl.create_default_context())
                 s.login(user, pwd)
                 s.sendmail(user, [to_addr], msg)
         else:
-            with smtplib.SMTP_SSL(host, port, timeout=12) as s:
+            # SSL typically uses port 465; fall back to provided port if different
+            ssl_port = 465 if port == 587 else port
+            with smtplib.SMTP_SSL(host, ssl_port, timeout=12) as s:
                 s.login(user, pwd)
                 s.sendmail(user, [to_addr], msg)
     except Exception as e:
@@ -236,9 +222,9 @@ def _smtp_send(to_addr: str, subject: str, body: str) -> None:
             st.warning(f"Email send failed to {to_addr}: {e}")
         except Exception:
             pass
- def _send_async(to_addr: str, subject: str, body: str) -> None:
-    threading.Thread(target=_smtp_send, args=(to_addr, subject, body), daemon=True).start()
 
+def _send_async(to_addr: str, subject: str, body: str) -> None:
+    threading.Thread(target=_smtp_send, args=(to_addr, subject, body), daemon=True).start()
 
 # -------------------------
 # Public Email Entry Points
@@ -367,5 +353,6 @@ def send_cancellation_emails(booking: Dict[str, Any]) -> None:
             f"Grade: {grade}\n"
         ),
     )
+
 
 
