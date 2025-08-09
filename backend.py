@@ -235,7 +235,8 @@ def _smtp_send(to_addr: str, subject: str, body: str) -> None:
         try:
             st.warning(f"Email send failed to {to_addr}: {e}")
         except Exception:
-            passdef _send_async(to_addr: str, subject: str, body: str) -> None:
+            pass
+ def _send_async(to_addr: str, subject: str, body: str) -> None:
     threading.Thread(target=_smtp_send, args=(to_addr, subject, body), daemon=True).start()
 
 
@@ -366,4 +367,5 @@ def send_cancellation_emails(booking: Dict[str, Any]) -> None:
             f"Grade: {grade}\n"
         ),
     )
+
 
