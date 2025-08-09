@@ -1,4 +1,5 @@
 import streamlit as st
+from backend import pick_teacher, record_booking, get_bookings_for_salesperson
 
 st.set_page_config(page_title="Salesperson Portal", page_icon="🧑‍💼", layout="wide")
 
@@ -37,3 +38,4 @@ with st.sidebar:
 
 st.title("Salesperson Portal")
 st.info("Login works. Next step we'll add the booking form + My Bookings table.")
+
