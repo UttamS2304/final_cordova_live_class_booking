@@ -3,18 +3,24 @@ from datetime import date, timedelta
 import pandas as pd
 
 from backend import (
-    pick_teacher,
-    exists_booking,
-    record_booking,
-    get_bookings_for_salesperson,
-    send_confirmation_emails,
+    pick_teacher, teacher_busy, exists_booking,
+    record_booking, get_bookings_for_salesperson,
+    send_confirmation_emails
 )
 
 st.set_page_config(page_title="Salesperson Portal", page_icon="🧑‍💼", layout="wide")
 
-# -------------------------
-# Session Login
-# -------------------------
+# Hide Streamlit/UI chrome
+st.markdown("""
+<style>
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+[data-testid="stDecoration"] {display: none;}
+</style>
+""", unsafe_allow_html=True)
+
+# -------------- Session Login --------------
 def salesperson_logged_in():
     return st.session_state.get("role") == "sales" and st.session_state.get("salesperson_email")
 
@@ -47,40 +53,21 @@ with st.sidebar:
         st.success("Logged out.")
         st.rerun()
 
-# -------------------------
-# Constants (with 'Select …' placeholders)
-# -------------------------
+# -------------- Constants --------------
 TODAY = date.today()
 MAX_DAY = TODAY + timedelta(days=60)
 
-SLOTS = [
-    "— Select slot —",
-    "10:00–10:40", "10:40–11:20", "11:20–12:00",
-    "12:20–13:00", "13:00–13:40", "13:40–14:20",
-    "14:20–15:00", "15:00–15:40",
-]
+SLOTS = ["— Select slot —","10:00–10:40","10:40–11:20","11:20–12:00",
+         "12:20–13:00","13:00–13:40","13:40–14:20","14:20–15:00","15:00–15:40"]
+SUBJECTS = ["— Select subject —","Hindi","Mathematics","GK","SST","Science","English","Pre Primary","EVS","Computer"]
+CURRICULA = ["— Select curriculum —","CBSE","ICSE","State Board","Other"]
+BOOKING_TYPES = ["Live Class","Product Training"]
 
-SUBJECTS = [
-    "— Select subject —",
-    "Hindi", "Mathematics", "GK", "SST", "Science", "English",
-    "Pre Primary", "EVS", "Computer",
-]
-
-CURRICULA = [
-    "— Select curriculum —",
-    "CBSE", "ICSE", "State Board", "Other",
-]
-
-BOOKING_TYPES = ["Live Class", "Product Training"]
-
-# -------------------------
-# Booking Form
-# -------------------------
+# -------------- Booking Form --------------
 st.title("📅 Create a Booking")
 
 with st.form("booking_form", clear_on_submit=False):
     col1, col2 = st.columns(2)
-
     with col1:
         booking_type = st.selectbox("Booking Type", BOOKING_TYPES, index=0)
         school_name  = st.text_input("School Name", placeholder="e.g., Springdale Public School")
@@ -89,43 +76,47 @@ with st.form("booking_form", clear_on_submit=False):
         subject      = st.selectbox("Subject", SUBJECTS, index=0)
         picked_date  = st.date_input("Date", value=TODAY, min_value=TODAY, max_value=MAX_DAY, format="YYYY-MM-DD")
         slot         = st.selectbox("Slot", SLOTS, index=0)
-
     with col2:
-        grade = (
-            st.text_input("Grade (Live Class only)", placeholder="e.g., 3")
-            if booking_type == "Live Class" else None
-        )
+        grade = st.text_input("Grade (Live Class only)", placeholder="e.g., 3") if booking_type == "Live Class" else None
         topic = st.text_input("Topic (optional)", placeholder="e.g., Fractions basics / Reading practice")
-
         st.text_input("Salesperson Name", value=st.session_state["salesperson_name"], disabled=True)
         st.text_input("Salesperson Number", value=st.session_state["salesperson_number"], disabled=True)
         st.text_input("Salesperson Email", value=st.session_state["salesperson_email"], disabled=True)
 
     submit = st.form_submit_button("Book Session", type="primary")
 
-# -------------------------
-# Submission Handling
-# -------------------------
+# Availability hint (nice touch)
+from teacher_mapping import candidates_for_subject
+from backend import is_teacher_unavailable
+if subject != SUBJECTS[0] and slot != SLOTS[0]:
+    tlist = candidates_for_subject(subject)
+    if tlist:
+        unavailable = [t for t in tlist if is_teacher_unavailable(t, str(picked_date), slot)]
+        available   = [t for t in tlist if t not in unavailable]
+        if available:
+            st.success(f"Likely teacher: {available[0]} (others free: {', '.join(available[1:]) or '—'})")
+        else:
+            st.error("All mapped teachers are unavailable for this slot.")
+
+# -------------- Submit --------------
 def invalid(msg: str) -> bool:
-    st.error(msg)
-    return True
+    st.error(msg); return True
 
 if submit:
-    # Required-field validation
     if not school_name.strip(): invalid("School Name is required.")
     elif curriculum == CURRICULA[0]: invalid("Please select a curriculum.")
     elif subject == SUBJECTS[0]: invalid("Please select a subject.")
     elif slot == SLOTS[0]: invalid("Please select a slot.")
     elif booking_type == "Live Class" and (not grade or not grade.strip()):
         invalid("Grade is required for Live Class.")
-    # Duplicate guard
     elif exists_booking(school_name.strip(), subject, str(picked_date), slot):
         st.warning("A booking already exists for this School, Subject, Date and Slot.")
     else:
-        # Smart teacher pick (respects unavailability)
         teacher = pick_teacher(subject, str(picked_date), slot)
         if not teacher:
             st.error("No teacher available for this subject/date/slot.")
+        elif teacher_busy(teacher, str(picked_date), slot):
+            st.error("Selected teacher is already booked in this slot.")
         else:
             data = {
                 "booking_type": booking_type,
@@ -144,25 +135,19 @@ if submit:
             }
             try:
                 record_booking(data)
-                # Non-blocking emails (Salesperson + Teacher + Admin)
                 send_confirmation_emails(data)
                 st.success(f"✅ Booked! Teacher: {teacher} | {subject} | {data['date']} {slot}")
-                st.rerun()  # refresh "My Bookings"
+                st.rerun()
             except Exception as e:
                 st.exception(e)
 
-# -------------------------
-# My Bookings
-# -------------------------
 st.divider()
 st.subheader("📋 My Bookings")
-
 my_rows = get_bookings_for_salesperson(st.session_state["salesperson_email"])
 if not my_rows:
     st.info("No bookings found.")
 else:
     st.dataframe(pd.DataFrame(my_rows), use_container_width=True, hide_index=True)
 
-# Footer
 st.markdown("<hr style='opacity:.2'>", unsafe_allow_html=True)
 st.caption("Made by Utt@m for Cordova Publications 2025")
