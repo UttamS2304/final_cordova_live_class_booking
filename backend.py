@@ -10,17 +10,19 @@ initialize_database()
 def connect_db():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-def is_teacher_unavailable(conn, teacher: str, date: str, slot: str) -> bool:
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT COUNT(*) FROM teacher_unavailability
-        WHERE teacher=? AND date=? AND (slot IS NULL OR slot=?)
-    """, (teacher, date, slot))
-    return cur.fetchone()[0] > 0
+def is_teacher_unavailable(teacher: str, date: str, slot: str) -> bool:
+    with connect_db() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(*) FROM teacher_unavailability
+            WHERE teacher=? AND date=? AND (slot IS NULL OR slot=?)
+        """, (teacher, date, slot))
+        return cur.fetchone()[0] > 0
 
-def pick_teacher(conn, subject: str, date: str, slot: str):
+def pick_teacher(subject: str, date: str, slot: str):
+    from teacher_mapping import candidates_for_subject
     for t in candidates_for_subject(subject):
-        if not is_teacher_unavailable(conn, t, date, slot):
+        if not is_teacher_unavailable(t, date, slot):
             return t
     return None
 
@@ -97,3 +99,4 @@ def delete_unavailability(unavail_id: int):
         cur = conn.cursor()
         cur.execute("DELETE FROM teacher_unavailability WHERE id=?", (unavail_id,))
         conn.commit()
+
