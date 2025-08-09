@@ -1,4 +1,4 @@
-# Order = priority (first is primary)
+# Priority order within each list (first is primary)
 TEACHER_MAP = {
     "Hindi": ["Bharti Ma'am"],
     "Mathematics": ["Vivek Sir"],
