@@ -1,4 +1,4 @@
-# backend.py — FINAL (robust email + logging)
+# backend.py — MAIL-ROBUST FINAL
 
 from __future__ import annotations
 import sqlite3, re, smtplib, ssl
@@ -10,15 +10,34 @@ import streamlit as st
 from init_db import initialize_database
 from teacher_mapping import candidates_for_subject
 
-# Ensure DB schema exists (bookings, unavailability, and email_events table in schema.sql)
+# -------------------------------
+# DB init (schema + email_events)
+# -------------------------------
 initialize_database()
-
 DB_PATH = "cordova_publication.db"
 
+def _ensure_email_log_table():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.executescript("""
+            CREATE TABLE IF NOT EXISTS email_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TEXT NOT NULL,
+              to_addr TEXT NOT NULL,
+              subject TEXT NOT NULL,
+              status TEXT NOT NULL,
+              error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_email_ts ON email_events(ts);
+            """)
+    except Exception as e:
+        print(f"[EMAIL][INIT-LOG-FAIL] {e}")
 
-# =========================
+_ensure_email_log_table()
+
+# -------------------------------
 # DB connection / helpers
-# =========================
+# -------------------------------
 @st.cache_resource
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -31,10 +50,9 @@ def _exec(q: str, args: tuple = ()) -> sqlite3.Cursor:
     cur.execute(q, args)
     return cur
 
-
-# =========================
+# -------------------------------
 # Availability & assignment
-# =========================
+# -------------------------------
 def is_teacher_unavailable(teacher: str, date: str, slot: str) -> bool:
     cur = _exec(
         """SELECT COUNT(*) FROM teacher_unavailability
@@ -49,10 +67,9 @@ def pick_teacher(subject: str, date: str, slot: str) -> Optional[str]:
             return t
     return None
 
-
-# =========================
+# -------------------------------
 # Guards
-# =========================
+# -------------------------------
 def exists_booking(school: str, subject: str, day: str, slot: str) -> bool:
     cur = _exec(
         "SELECT 1 FROM bookings WHERE school_name=? AND subject=? AND date=? AND slot=? LIMIT 1",
@@ -67,10 +84,9 @@ def teacher_busy(teacher: str, day: str, slot: str) -> bool:
     )
     return cur.fetchone() is not None
 
-
-# =========================
+# -------------------------------
 # Bookings CRUD
-# =========================
+# -------------------------------
 def record_booking(data: Dict[str, Any]) -> int:
     cur = _exec(
         """INSERT INTO bookings (
@@ -121,30 +137,10 @@ def delete_booking(booking_id: int) -> None:
     get_conn().commit()
     get_all_bookings.clear(); get_bookings_for_salesperson.clear()
 
-
-# =========================
-# Teacher Unavailability
-# =========================
-def mark_unavailable(teacher: str, date: str, slot: Optional[str]) -> None:
-    _exec("INSERT INTO teacher_unavailability (teacher, date, slot) VALUES (?, ?, ?)",
-          (teacher, date, slot))
-    get_conn().commit()
-
-def list_unavailability() -> List[Dict[str, Any]]:
-    cur = _exec("SELECT id, teacher, date, slot FROM teacher_unavailability ORDER BY date DESC")
-    cols = ["id","Teacher","Date","Slot"]
-    return [dict(zip(cols, r)) for r in cur.fetchall()]
-
-def delete_unavailability(unavail_id: int) -> None:
-    _exec("DELETE FROM teacher_unavailability WHERE id=?", (unavail_id,))
-    get_conn().commit()
-
-
-# =========================
+# -------------------------------
 # Email system (robust)
-# =========================
+# -------------------------------
 def _elog(msg: str):
-    # visible in Streamlit Cloud logs
     print(f"[EMAIL] {msg}")
 
 def _norm_key(name: str) -> str:
@@ -159,7 +155,6 @@ def get_teacher_email(teacher: str) -> str:
         _elog(f"teacher email missing for key={key} (teacher={teacher}) — skipping teacher mail")
     return addr
 
-# ------- email log (DB) -------
 def _log_email(to_addr: str, subject: str, status: str, error: str | None = None):
     try:
         _exec(
@@ -170,27 +165,19 @@ def _log_email(to_addr: str, subject: str, status: str, error: str | None = None
     except Exception as e:
         print(f"[EMAIL][LOG-FAIL] {e}")
 
-@st.cache_data(show_spinner=False, ttl=60)
-def get_email_events(limit: int = 200):
-    cur = _exec(
-        "SELECT id, ts, to_addr, subject, status, error FROM email_events ORDER BY id DESC LIMIT ?",
-        (limit,),
-    )
-    cols = ["id","ts","to","subject","status","error"]
-    return [dict(zip(cols, r)) for r in cur.fetchall()]
+def _secrets_ok() -> bool:
+    req = ("EMAIL_HOST","EMAIL_PORT","EMAIL_USER","EMAIL_PASS")
+    return all(st.secrets.get(k) for k in req)
 
-def resend_email(event_id: int):
-    cur = _exec("SELECT to_addr, subject FROM email_events WHERE id=?", (event_id,))
-    row = cur.fetchone()
-    if not row:
-        return
-    to_addr, subject = row
-    _smtp_send(to_addr, subject, f"[RESEND] This is a resend attempt for '{subject}'.")
-
-# ------- core SMTP with retry -------
+# Core SMTP with one retry + DB logging
 def _smtp_send(to_addr: str, subject: str, body: str) -> None:
     if not to_addr:
         _elog("skip: empty to_addr"); return
+
+    if not _secrets_ok():
+        _elog("skip: incomplete secrets")
+        _log_email(to_addr, subject, "failed", "incomplete secrets")
+        return
 
     host = st.secrets.get("EMAIL_HOST", "smtp.gmail.com")
     port = int(st.secrets.get("EMAIL_PORT", 587))
@@ -198,15 +185,10 @@ def _smtp_send(to_addr: str, subject: str, body: str) -> None:
     pwd  = st.secrets.get("EMAIL_PASS", "")
     use_tls = str(st.secrets.get("EMAIL_USE_TLS", "true")).lower() == "true"
 
-    if not (host and port and user and pwd):
-        _elog("skip: incomplete secrets")
-        _log_email(to_addr, subject, "failed", "incomplete secrets")
-        return
-
     msg = f"Subject: {subject}\r\nFrom: {user}\r\nTo: {to_addr}\r\n\r\n{body}"
     last_err = None
 
-    for attempt in (1, 2):  # one retry
+    for attempt in (1, 2):
         try:
             _elog(f"sending (try {attempt}) → to={to_addr}, host={host}:{port}, tls={use_tls}")
             if use_tls:
@@ -228,29 +210,25 @@ def _smtp_send(to_addr: str, subject: str, body: str) -> None:
 
     _log_email(to_addr, subject, "failed", last_err)
 
-# persistent executor (non-daemon)
+# persistent executor
 @st.cache_resource
 def get_mail_executor() -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=4)
 
 def _email_sync_mode() -> bool:
-    # set EMAIL_SYNC="true" in secrets for inline sending (useful for debugging)
-    return str(st.secrets.get("EMAIL_SYNC", "false")).lower() == "true"
+    # Default ON for reliability; set EMAIL_SYNC="false" to queue async
+    return str(st.secrets.get("EMAIL_SYNC", "true")).lower() == "true"
 
 def _send_async(to_addr: str, subject: str, body: str):
     if _email_sync_mode():
-        _elog("SYNC MODE on — sending immediately")
+        _elog("SYNC MODE — sending immediately")
         _smtp_send(to_addr, subject, body)
     else:
         _elog("queueing (async)")
         get_mail_executor().submit(_smtp_send, to_addr, subject, body)
 
-
-# =========================
 # Public email entry points
-# =========================
 def send_confirmation_emails(booking: Dict[str, Any]) -> None:
-    """Salesperson (confirmation), Teacher (assignment), Admin (summary)"""
     def g(CAPS: str, form: str) -> Any:
         return booking.get(CAPS) if CAPS in booking else booking.get(form)
 
@@ -286,7 +264,6 @@ def send_confirmation_emails(booking: Dict[str, Any]) -> None:
             f"Salesperson: {sp_name}\nSalesperson Email: {sp_email}\n")
 
 def send_cancellation_emails(booking: Dict[str, Any]) -> None:
-    """Salesperson (cancel), Teacher (cancel)"""
     def g(CAPS: str, form: str) -> Any:
         return booking.get(CAPS) if CAPS in booking else booking.get(form)
 
@@ -308,3 +285,23 @@ def send_cancellation_emails(booking: Dict[str, Any]) -> None:
         _send_async(t_email, "❌ Cordova Session Cancelled",
             "Your assigned session has been cancelled.\n\n"
             f"Subject: {subj}\nDate: {day}\nSlot: {slot}\nSchool: {school}\nGrade: {grade}\n")
+
+# -------------------------------
+# Email log APIs (Admin → Analytics)
+# -------------------------------
+@st.cache_data(show_spinner=False, ttl=60)
+def get_email_events(limit: int = 200):
+    cur = _exec(
+        "SELECT id, ts, to_addr, subject, status, error FROM email_events ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    cols = ["id","ts","to","subject","status","error"]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+def resend_email(event_id: int):
+    cur = _exec("SELECT to_addr, subject FROM email_events WHERE id=?", (event_id,))
+    row = cur.fetchone()
+    if not row:
+        return
+    to_addr, subject = row
+    _smtp_send(to_addr, subject, f"[RESEND] This is a resend attempt for '{subject}'.")
