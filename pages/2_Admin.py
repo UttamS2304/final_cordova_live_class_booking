@@ -1,17 +1,24 @@
-# pages/2_Admin.py — FINAL (no st.modal, version-safe confirms)
+# pages/2_Admin.py — FINAL (Admin + Email Log, no st.modal)
+
+import sys, os
+# Ensure project root (where backend.py lives) is importable
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 import streamlit as st
 from datetime import date
 
 from backend import (
+    # bookings
     get_all_bookings, delete_booking,
+    # unavailability
     mark_unavailable, list_unavailability, delete_unavailability,
-    send_cancellation_emails
+    # emails
+    send_cancellation_emails, get_email_events, resend_email,
 )
 
 st.set_page_config(page_title="Admin Dashboard", page_icon="🔐", layout="wide")
 
-# Hide chrome
+# Hide Streamlit/GitHub chrome
 st.markdown("""
 <style>
 #MainMenu, footer, header {visibility: hidden;}
@@ -20,8 +27,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# -------- Admin Gate --------
-def admin_logged_in(): 
+# ---------------- Admin auth ----------------
+def admin_logged_in():
     return st.session_state.get("role") == "admin"
 
 def admin_login_form():
@@ -32,24 +39,28 @@ def admin_login_form():
         ok = st.form_submit_button("Login")
     if ok:
         if u == st.secrets.get("ADMIN_USERNAME") and p == st.secrets.get("ADMIN_PASSWORD"):
-            st.session_state["role"] = "admin"; st.rerun()
+            st.session_state["role"] = "admin"
+            st.rerun()
         else:
             st.error("Invalid admin credentials.")
 
 if not admin_logged_in():
-    admin_login_form(); st.stop()
+    admin_login_form()
+    st.stop()
 
 with st.sidebar:
     if st.button("Logout", use_container_width=True):
-        st.session_state.clear(); st.rerun()
+        st.session_state.clear()
+        st.rerun()
 
 st.title("Admin Dashboard")
-tab_view, tab_unavail, tab_analytics = st.tabs(
-    ["📋 View & Delete Bookings", "🧑‍🏫 Teacher Unavailability", "📈 Analytics (Coming Soon)"]
+
+tab_view, tab_unavail, tab_email = st.tabs(
+    ["📋 View & Delete Bookings", "🧑‍🏫 Teacher Unavailability", "📧 Email Log"]
 )
 
 # =======================
-# 📋 View & Delete
+# 📋 View & Delete Bookings
 # =======================
 with tab_view:
     rows = get_all_bookings()
@@ -59,12 +70,19 @@ with tab_view:
         import pandas as pd
         df = pd.DataFrame(rows)
 
+        # Stats
+        cA, cB, cC = st.columns(3)
+        cA.metric("Total bookings", len(df))
+        cB.metric("Unique schools", df["School"].nunique())
+        cC.metric("Unique teachers", df["Teacher"].nunique())
+
+        # Filters
         with st.expander("Filters", expanded=False):
-            c1, c2, c3, c4 = st.columns(4)
-            subj = c1.selectbox("Subject", ["(All)"] + sorted(df["Subject"].dropna().unique().tolist()))
-            sp   = c2.selectbox("Salesperson", ["(All)"] + sorted(df["Salesperson"].dropna().unique().tolist()))
-            sch  = c3.selectbox("School", ["(All)"] + sorted(df["School"].dropna().unique().tolist()))
-            day  = c4.date_input("Date", value=None, format="YYYY-MM-DD")
+            f1, f2, f3, f4 = st.columns(4)
+            subj = f1.selectbox("Subject", ["(All)"] + sorted(df["Subject"].dropna().unique().tolist()))
+            sp   = f2.selectbox("Salesperson", ["(All)"] + sorted(df["Salesperson"].dropna().unique().tolist()))
+            sch  = f3.selectbox("School", ["(All)"] + sorted(df["School"].dropna().unique().tolist()))
+            day  = f4.date_input("Date", value=None, format="YYYY-MM-DD")
             query = st.text_input("Search", placeholder="School / Subject / Teacher").strip().lower()
 
         fdf = df.copy()
@@ -102,7 +120,7 @@ with tab_view:
             chosen_id = int(choice.split(" | ", 1)[0])
             chosen_row = fdf[fdf["id"] == chosen_id].iloc[0].to_dict()
 
-            # --- Inline confirmation (no st.modal) ---
+            # Version-safe inline confirm (no st.modal required)
             confirm_key = "confirm_delete_open"
             if st.button("Delete Booking ❌", type="primary"):
                 st.session_state[confirm_key] = True
@@ -110,11 +128,12 @@ with tab_view:
             if st.session_state.get(confirm_key):
                 st.warning("This will delete the booking and trigger cancellation emails.")
                 st.json({k: chosen_row[k] for k in ["School","Subject","Date","Slot","Teacher","Salesperson"]})
-                c1, c2 = st.columns(2)
-                with c1:
+                cc1, cc2 = st.columns(2)
+                with cc1:
                     if st.button("Yes, delete", type="primary", use_container_width=True, key="confirm_del_yes"):
                         try:
-                            send_cancellation_emails(chosen_row)  # emails first
+                            # Send cancellation emails first, then delete
+                            send_cancellation_emails(chosen_row)
                             delete_booking(chosen_id)
                             st.session_state[confirm_key] = False
                             st.success("Booking deleted and cancellation emails triggered.")
@@ -122,22 +141,21 @@ with tab_view:
                         except Exception as e:
                             st.session_state[confirm_key] = False
                             st.exception(e)
-                with c2:
+                with cc2:
                     if st.button("Cancel", use_container_width=True, key="confirm_del_no"):
                         st.session_state[confirm_key] = False
                         st.info("Deletion cancelled.")
 
 # =======================
-# 🧑‍🏫 Unavailability
+# 🧑‍🏫 Teacher Unavailability
 # =======================
 with tab_unavail:
     st.subheader("Mark Teacher Unavailable")
 
     # Build teacher list from mapping + bookings + secrets
     from teacher_mapping import TEACHER_MAP
-    from backend import get_all_bookings as _all
     all_from_map = {t for lst in TEACHER_MAP.values() for t in lst}
-    rows_for_teachers = _all()
+    rows_for_teachers = get_all_bookings()
     all_from_bookings = {r["Teacher"] for r in rows_for_teachers} if rows_for_teachers else set()
 
     def prettify_key(k: str) -> str:
@@ -184,7 +202,7 @@ with tab_unavail:
         to_remove = st.selectbox("Remove entry", labels, key="unavail_pick")
         unavail_id = int(to_remove.split(" | ", 1)[0])
 
-        # --- Inline confirmation (no st.modal) ---
+        # Version-safe inline confirm
         u_confirm_key = "confirm_unavail_delete_open"
         if st.button("Unmark (Delete Entry) ✅"):
             st.session_state[u_confirm_key] = True
@@ -209,7 +227,25 @@ with tab_unavail:
                     st.info("Removal cancelled.")
 
 # =======================
-# 📈 Analytics (placeholder)
+# 📧 Email Log (view + resend)
 # =======================
-with tab_analytics:
-    st.info("Charts coming soon.")
+with tab_email:
+    st.subheader("Email Log (latest 200)")
+    import pandas as pd
+
+    events = get_email_events(200)
+    if not events:
+        st.info("No email events yet.")
+    else:
+        df = pd.DataFrame(events)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        ids = [f"{r['id']} | {r['ts']} | {r['to']} | {r['status']}" for r in events]
+        pick = st.selectbox("Select an event to resend", ids, key="resend_pick")
+        event_id = int(pick.split(" | ", 1)[0])
+        if st.button("Resend selected email"):
+            try:
+                resend_email(event_id)
+                st.success("Resend queued/sent (check Email Log for new entry).")
+            except Exception as e:
+                st.exception(e)
