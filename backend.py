@@ -1,4 +1,4 @@
-# backend.py — FINAL
+# backend.py — FINAL (friendly messages + caps + robust email)
 
 from __future__ import annotations
 import sqlite3, re, smtplib, ssl
@@ -12,7 +12,7 @@ from init_db import initialize_database
 from teacher_mapping import candidates_for_subject
 
 # -----------------------------------------------------------------------------
-# DB bootstrap (schema from schema.sql) + ensure email log table
+# DB bootstrap
 # -----------------------------------------------------------------------------
 initialize_database()
 DB_PATH = "cordova_publication.db"
@@ -76,7 +76,7 @@ def _per_teacher_limits() -> dict:
             limits[_norm_key(k)] = int(v)
         except Exception:
             pass
-    limits.setdefault("MEGHA", 1)  # Hard rule
+    limits.setdefault("MEGHA", 1)  # Hard rule: Megha = 1/day
     return limits
 
 @st.cache_data(show_spinner=False, ttl=60)
