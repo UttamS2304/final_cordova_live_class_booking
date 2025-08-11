@@ -12,7 +12,7 @@ from init_db import initialize_database
 from teacher_mapping import candidates_for_subject
 
 # -----------------------------------------------------------------------------
-# DB init (schema from schema.sql) + ensure email log table
+# DB bootstrap (schema from schema.sql) + ensure email log table
 # -----------------------------------------------------------------------------
 initialize_database()
 DB_PATH = "cordova_publication.db"
@@ -20,8 +20,7 @@ DB_PATH = "cordova_publication.db"
 def _ensure_email_log_table() -> None:
     try:
         with sqlite3.connect(DB_PATH) as conn:
-            conn.executescript(
-                """
+            conn.executescript("""
                 CREATE TABLE IF NOT EXISTS email_events (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   ts TEXT NOT NULL,
@@ -31,8 +30,7 @@ def _ensure_email_log_table() -> None:
                   error TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_email_ts ON email_events(ts);
-                """
-            )
+            """)
     except Exception as e:
         print(f"[EMAIL][INIT-LOG-FAIL] {e}")
 
@@ -78,7 +76,7 @@ def _per_teacher_limits() -> dict:
             limits[_norm_key(k)] = int(v)
         except Exception:
             pass
-    limits.setdefault("MEGHA", 1)  # hard rule: Megha one class/day
+    limits.setdefault("MEGHA", 1)  # Hard rule
     return limits
 
 @st.cache_data(show_spinner=False, ttl=60)
@@ -97,17 +95,13 @@ def is_teacher_unavailable(teacher: str, date: str, slot: str) -> bool:
     return cur.fetchone()[0] > 0
 
 def teacher_busy(teacher: str, day: str, slot: str) -> bool:
-    cur = _exec(
-        "SELECT 1 FROM bookings WHERE teacher=? AND date=? AND slot=? LIMIT 1",
-        (teacher, day, slot),
-    )
+    cur = _exec("SELECT 1 FROM bookings WHERE teacher=? AND date=? AND slot=? LIMIT 1",
+                (teacher, day, slot))
     return cur.fetchone() is not None
 
 def exists_booking(school: str, subject: str, day: str, slot: str) -> bool:
-    cur = _exec(
-        "SELECT 1 FROM bookings WHERE school_name=? AND subject=? AND date=? AND slot=? LIMIT 1",
-        (school, subject, day, slot),
-    )
+    cur = _exec("SELECT 1 FROM bookings WHERE school_name=? AND subject=? AND date=? AND slot=? LIMIT 1",
+                (school, subject, day, slot))
     return cur.fetchone() is not None
 
 def count_teacher_on_day(teacher: str, day: str) -> int:
@@ -119,7 +113,7 @@ def count_parallel_on_slot(day: str, slot: str) -> int:
     return int(cur.fetchone()[0])
 
 # -----------------------------------------------------------------------------
-# Teacher choice (with availability + caps)
+# Teacher choice (availability + caps)
 # -----------------------------------------------------------------------------
 def pick_teacher(subject: str, date: str, slot: str) -> Optional[str]:
     """
@@ -139,28 +133,29 @@ def pick_teacher(subject: str, date: str, slot: str) -> Optional[str]:
     return None
 
 # -----------------------------------------------------------------------------
-# Bookings CRUD (with safety checks)
+# Bookings CRUD (friendly messages, no tracebacks)
 # -----------------------------------------------------------------------------
-def record_booking(data: Dict[str, Any]) -> int:
-    # Safety re-checks (even if caller skipped attempt_booking)
+def record_booking(data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]]:
+    """
+    Insert booking after guard checks.
+    Returns (ok, message, booking_id|None). Never raises for user errors.
+    """
     day = data["date"]; slot = data["slot"]; subj = data["subject"]
     school = data["school_name"]; teacher = data["teacher"]
 
-    # parallel cap
+    # Parallel cap
     if count_parallel_on_slot(day, slot) >= MAX_PARALLEL_CLASSES_PER_SLOT:
-        raise sqlite3.IntegrityError(
-            f"parallel cap exceeded ({MAX_PARALLEL_CLASSES_PER_SLOT}) for {day} {slot}"
-        )
-    # duplicate guard: same school+subject same date+slot
+        return False, "This slot is full. Please choose another time.", None
+
+    # Duplicate guard
     if exists_booking(school, subj, day, slot):
-        raise sqlite3.IntegrityError("duplicate school+subject for same date+slot")
-    # teacher slot and daily cap
+        return False, "This school & subject is already booked for that date & slot.", None
+
+    # Teacher slot & daily cap
     if is_teacher_unavailable(teacher, day, slot) or teacher_busy(teacher, day, slot):
-        raise sqlite3.IntegrityError("teacher not available in this slot")
+        return False, "Selected teacher is not available in this slot.", None
     if count_teacher_on_day(teacher, day) >= daily_limit_for_teacher(teacher):
-        raise sqlite3.IntegrityError(
-            f"teacher daily cap {daily_limit_for_teacher(teacher)} reached"
-        )
+        return False, f"{teacher} has reached the daily limit ({daily_limit_for_teacher(teacher)}).", None
 
     cur = _exec(
         """INSERT INTO bookings (
@@ -179,7 +174,7 @@ def record_booking(data: Dict[str, Any]) -> int:
     )
     get_conn().commit()
     get_all_bookings.clear(); get_bookings_for_salesperson.clear()
-    return cur.lastrowid
+    return True, "Booking successfully created.", cur.lastrowid
 
 @st.cache_data(show_spinner=False, ttl=60)
 def get_bookings_for_salesperson(email: str) -> List[Dict[str, Any]]:
@@ -217,40 +212,36 @@ def delete_booking(booking_id: int) -> None:
 def attempt_booking(form_data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]]:
     """
     Applies constraints, picks teacher, records booking, sends emails.
-    form_data keys:
-      booking_type, school_name, title_used?, grade?, curriculum?, subject,
-      date, slot, topic?, salesperson_name, salesperson_number, salesperson_email
+    Caller should display the returned message to the user.
     """
     day  = form_data["date"]
     slot = form_data["slot"]
     subj = form_data["subject"]
 
-    # parallel capacity
+    # Parallel capacity
     if count_parallel_on_slot(day, slot) >= MAX_PARALLEL_CLASSES_PER_SLOT:
-        return False, f"Maximum parallel classes reached for {day} {slot} (limit {MAX_PARALLEL_CLASSES_PER_SLOT}).", None
+        return False, "This slot is full. Please choose another time.", None
 
-    # duplicate guard
+    # Duplicate guard
     if exists_booking(form_data["school_name"], subj, day, slot):
         return False, "This school & subject is already booked for that date & slot.", None
 
-    # teacher selection
+    # Teacher selection
     teacher = pick_teacher(subj, day, slot)
     if not teacher:
         return False, "No suitable teacher available (busy/unavailable/daily cap reached).", None
 
-    # final per-teacher cap
+    # Final per-teacher cap (belt & suspenders)
     if count_teacher_on_day(teacher, day) >= daily_limit_for_teacher(teacher):
         return False, f"{teacher} has reached the daily limit ({daily_limit_for_teacher(teacher)}).", None
 
-    row = dict(form_data)
-    row["teacher"] = teacher
+    row = dict(form_data); row["teacher"] = teacher
 
-    try:
-        booking_id = record_booking(row)
-    except sqlite3.IntegrityError as e:
-        return False, f"Booking conflict: {e}", None
+    ok, msg, booking_id = record_booking(row)
+    if not ok:
+        return False, msg, None
 
-    # emails (confirmation)
+    # Emails (confirmation)
     try:
         send_confirmation_emails({
             "Salesperson Email": row["salesperson_email"],
@@ -272,8 +263,7 @@ def attempt_booking(form_data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]
 # -----------------------------------------------------------------------------
 # Email system (UTF-8 safe, logging, resend)
 # -----------------------------------------------------------------------------
-def _elog(msg: str):
-    print(f"[EMAIL] {msg}")
+def _elog(msg: str): print(f"[EMAIL] {msg}")
 
 def get_teacher_email(teacher: str) -> str:
     """
@@ -285,7 +275,6 @@ def get_teacher_email(teacher: str) -> str:
         _elog("teacher email lookup skipped: empty teacher"); return ""
     key_norm = _norm_key(teacher)
     val = book.get(key_norm)
-
     if not val:
         alt_keys = {
             key_norm.replace("MAAM", "MAM"),
@@ -298,7 +287,6 @@ def get_teacher_email(teacher: str) -> str:
     if not val:
         lower_map = {k.lower(): v for k, v in book.items()}
         val = lower_map.get(key_norm.lower(), "")
-
     if not val:
         _elog(f"teacher email missing for key={key_norm} (teacher='{teacher}')")
         return ""
@@ -307,16 +295,14 @@ def get_teacher_email(teacher: str) -> str:
 
 def _log_email(to_addr: str, subject: str, status: str, error: str | None = None):
     try:
-        _exec(
-            "INSERT INTO email_events (ts, to_addr, subject, status, error) VALUES (?, ?, ?, ?, ?)",
-            (datetime.now().isoformat(timespec="seconds"), to_addr, subject, status, error),
-        )
+        _exec("INSERT INTO email_events (ts, to_addr, subject, status, error) VALUES (?, ?, ?, ?, ?)",
+              (datetime.now().isoformat(timespec="seconds"), to_addr, subject, status, error))
         get_conn().commit()
     except Exception as e:
         print(f"[EMAIL][LOG-FAIL] {e}")
 
-# Core SMTP with one retry + DB logging (UTF-8 safe)
 def _smtp_send(to_addr: str, subject: str, body: str) -> None:
+    """UTF-8 safe SMTP with 1 retry + DB logging."""
     if not to_addr:
         _elog("skip: empty to_addr"); return
 
@@ -359,13 +345,12 @@ def _smtp_send(to_addr: str, subject: str, body: str) -> None:
             _elog(f"FAIL try {attempt} to={to_addr}: {e}")
     _log_email(to_addr, subject, "failed", last_err)
 
-# persistent executor (for async confirmations)
 @st.cache_resource
 def get_mail_executor() -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=4)
 
 def _email_sync_mode() -> bool:
-    # Default ON for reliability; set EMAIL_SYNC="false" in secrets to queue async
+    # Default ON for reliability; set EMAIL_SYNC="false" to queue async
     return str(st.secrets.get("EMAIL_SYNC", "true")).lower() == "true"
 
 def _send_async(to_addr: str, subject: str, body: str):
@@ -376,7 +361,6 @@ def _send_async(to_addr: str, subject: str, body: str):
         _elog("queueing (async)")
         get_mail_executor().submit(_smtp_send, to_addr, subject, body)
 
-# Public email entry points
 def send_confirmation_emails(booking: Dict[str, Any]) -> None:
     def g(CAPS: str, form: str) -> Any:
         return booking.get(CAPS) if CAPS in booking else booking.get(form)
