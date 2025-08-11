@@ -1,9 +1,9 @@
-# backend.py — MAIL-ROBUST FINAL (clean)
+# backend.py — FINAL
 
 from __future__ import annotations
 import sqlite3, re, smtplib, ssl
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
 
@@ -11,34 +11,36 @@ import streamlit as st
 from init_db import initialize_database
 from teacher_mapping import candidates_for_subject
 
-# -------------------------------
-# DB init (schema + email_events)
-# -------------------------------
+# -----------------------------------------------------------------------------
+# DB init (schema from schema.sql) + ensure email log table
+# -----------------------------------------------------------------------------
 initialize_database()
 DB_PATH = "cordova_publication.db"
 
 def _ensure_email_log_table() -> None:
     try:
         with sqlite3.connect(DB_PATH) as conn:
-            conn.executescript("""
-            CREATE TABLE IF NOT EXISTS email_events (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              ts TEXT NOT NULL,
-              to_addr TEXT NOT NULL,
-              subject TEXT NOT NULL,
-              status TEXT NOT NULL,
-              error TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_email_ts ON email_events(ts);
-            """)
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS email_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  ts TEXT NOT NULL,
+                  to_addr TEXT NOT NULL,
+                  subject TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_email_ts ON email_events(ts);
+                """
+            )
     except Exception as e:
         print(f"[EMAIL][INIT-LOG-FAIL] {e}")
 
 _ensure_email_log_table()
 
-# -------------------------------
-# DB connection / helpers
-# -------------------------------
+# -----------------------------------------------------------------------------
+# Connection helpers
+# -----------------------------------------------------------------------------
 @st.cache_resource
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -51,9 +53,41 @@ def _exec(q: str, args: tuple = ()) -> sqlite3.Cursor:
     cur.execute(q, args)
     return cur
 
-# -------------------------------
-# Availability & assignment
-# -------------------------------
+# -----------------------------------------------------------------------------
+# Capacity configuration (overridable via secrets)
+# -----------------------------------------------------------------------------
+DEFAULT_MAX_PER_TEACHER = int(st.secrets.get("MAX_CLASSES_PER_TEACHER_PER_DAY", 2))
+MAX_PARALLEL_CLASSES_PER_SLOT = int(st.secrets.get("MAX_PARALLEL_CLASSES_PER_SLOT", 3))
+
+def _norm_key(name: str) -> str:
+    name = (name or "").upper()
+    return re.sub(r"[^A-Z0-9]+", "_", name).strip("_")
+
+def _per_teacher_limits() -> dict:
+    """
+    Optional overrides in secrets:
+      [PER_TEACHER_LIMITS]
+      MEGHA = "1"
+      VIVEK_SIR = "2"
+    Hard default below ensures Megha = 1/day even if secrets omitted.
+    """
+    raw = st.secrets.get("PER_TEACHER_LIMITS", {})
+    limits: dict[str, int] = {}
+    for k, v in raw.items():
+        try:
+            limits[_norm_key(k)] = int(v)
+        except Exception:
+            pass
+    limits.setdefault("MEGHA", 1)  # hard rule: Megha one class/day
+    return limits
+
+@st.cache_data(show_spinner=False, ttl=60)
+def daily_limit_for_teacher(teacher: str) -> int:
+    return _per_teacher_limits().get(_norm_key(teacher), DEFAULT_MAX_PER_TEACHER)
+
+# -----------------------------------------------------------------------------
+# Availability & guards
+# -----------------------------------------------------------------------------
 def is_teacher_unavailable(teacher: str, date: str, slot: str) -> bool:
     cur = _exec(
         """SELECT COUNT(*) FROM teacher_unavailability
@@ -62,22 +96,6 @@ def is_teacher_unavailable(teacher: str, date: str, slot: str) -> bool:
     )
     return cur.fetchone()[0] > 0
 
-def pick_teacher(subject: str, date: str, slot: str) -> Optional[str]:
-    for t in candidates_for_subject(subject):
-        if not is_teacher_unavailable(t, date, slot):
-            return t
-    return None
-
-# -------------------------------
-# Guards
-# -------------------------------
-def exists_booking(school: str, subject: str, day: str, slot: str) -> bool:
-    cur = _exec(
-        "SELECT 1 FROM bookings WHERE school_name=? AND subject=? AND date=? AND slot=? LIMIT 1",
-        (school, subject, day, slot),
-    )
-    return cur.fetchone() is not None
-
 def teacher_busy(teacher: str, day: str, slot: str) -> bool:
     cur = _exec(
         "SELECT 1 FROM bookings WHERE teacher=? AND date=? AND slot=? LIMIT 1",
@@ -85,10 +103,65 @@ def teacher_busy(teacher: str, day: str, slot: str) -> bool:
     )
     return cur.fetchone() is not None
 
-# -------------------------------
-# Bookings CRUD
-# -------------------------------
+def exists_booking(school: str, subject: str, day: str, slot: str) -> bool:
+    cur = _exec(
+        "SELECT 1 FROM bookings WHERE school_name=? AND subject=? AND date=? AND slot=? LIMIT 1",
+        (school, subject, day, slot),
+    )
+    return cur.fetchone() is not None
+
+def count_teacher_on_day(teacher: str, day: str) -> int:
+    cur = _exec("SELECT COUNT(*) FROM bookings WHERE teacher=? AND date=?", (teacher, day))
+    return int(cur.fetchone()[0])
+
+def count_parallel_on_slot(day: str, slot: str) -> int:
+    cur = _exec("SELECT COUNT(*) FROM bookings WHERE date=? AND slot=?", (day, slot))
+    return int(cur.fetchone()[0])
+
+# -----------------------------------------------------------------------------
+# Teacher choice (with availability + caps)
+# -----------------------------------------------------------------------------
+def pick_teacher(subject: str, date: str, slot: str) -> Optional[str]:
+    """
+    Pick first candidate who:
+      - not unavailable,
+      - not already booked in slot,
+      - under per-teacher daily limit for that date.
+    """
+    for t in candidates_for_subject(subject):
+        if is_teacher_unavailable(t, date, slot):
+            continue
+        if teacher_busy(t, date, slot):
+            continue
+        if count_teacher_on_day(t, date) >= daily_limit_for_teacher(t):
+            continue
+        return t
+    return None
+
+# -----------------------------------------------------------------------------
+# Bookings CRUD (with safety checks)
+# -----------------------------------------------------------------------------
 def record_booking(data: Dict[str, Any]) -> int:
+    # Safety re-checks (even if caller skipped attempt_booking)
+    day = data["date"]; slot = data["slot"]; subj = data["subject"]
+    school = data["school_name"]; teacher = data["teacher"]
+
+    # parallel cap
+    if count_parallel_on_slot(day, slot) >= MAX_PARALLEL_CLASSES_PER_SLOT:
+        raise sqlite3.IntegrityError(
+            f"parallel cap exceeded ({MAX_PARALLEL_CLASSES_PER_SLOT}) for {day} {slot}"
+        )
+    # duplicate guard: same school+subject same date+slot
+    if exists_booking(school, subj, day, slot):
+        raise sqlite3.IntegrityError("duplicate school+subject for same date+slot")
+    # teacher slot and daily cap
+    if is_teacher_unavailable(teacher, day, slot) or teacher_busy(teacher, day, slot):
+        raise sqlite3.IntegrityError("teacher not available in this slot")
+    if count_teacher_on_day(teacher, day) >= daily_limit_for_teacher(teacher):
+        raise sqlite3.IntegrityError(
+            f"teacher daily cap {daily_limit_for_teacher(teacher)} reached"
+        )
+
     cur = _exec(
         """INSERT INTO bookings (
             booking_type, school_name, title_used, grade, curriculum, subject,
@@ -98,9 +171,9 @@ def record_booking(data: Dict[str, Any]) -> int:
         (
             data["booking_type"], data["school_name"], data.get("title_used"),
             data.get("grade"), data.get("curriculum"), data["subject"],
-            data["date"], data["slot"], data.get("topic"),
+            day, slot, data.get("topic"),
             data["salesperson_name"], data["salesperson_number"],
-            data["salesperson_email"], data["teacher"],
+            data["salesperson_email"], teacher,
             datetime.now().isoformat(timespec="seconds"),
         ),
     )
@@ -138,26 +211,79 @@ def delete_booking(booking_id: int) -> None:
     get_conn().commit()
     get_all_bookings.clear(); get_bookings_for_salesperson.clear()
 
-# -------------------------------
-# Email system (robust)
-# -------------------------------
+# -----------------------------------------------------------------------------
+# Attempt booking API (apply all rules, send mail)
+# -----------------------------------------------------------------------------
+def attempt_booking(form_data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]]:
+    """
+    Applies constraints, picks teacher, records booking, sends emails.
+    form_data keys:
+      booking_type, school_name, title_used?, grade?, curriculum?, subject,
+      date, slot, topic?, salesperson_name, salesperson_number, salesperson_email
+    """
+    day  = form_data["date"]
+    slot = form_data["slot"]
+    subj = form_data["subject"]
+
+    # parallel capacity
+    if count_parallel_on_slot(day, slot) >= MAX_PARALLEL_CLASSES_PER_SLOT:
+        return False, f"Maximum parallel classes reached for {day} {slot} (limit {MAX_PARALLEL_CLASSES_PER_SLOT}).", None
+
+    # duplicate guard
+    if exists_booking(form_data["school_name"], subj, day, slot):
+        return False, "This school & subject is already booked for that date & slot.", None
+
+    # teacher selection
+    teacher = pick_teacher(subj, day, slot)
+    if not teacher:
+        return False, "No suitable teacher available (busy/unavailable/daily cap reached).", None
+
+    # final per-teacher cap
+    if count_teacher_on_day(teacher, day) >= daily_limit_for_teacher(teacher):
+        return False, f"{teacher} has reached the daily limit ({daily_limit_for_teacher(teacher)}).", None
+
+    row = dict(form_data)
+    row["teacher"] = teacher
+
+    try:
+        booking_id = record_booking(row)
+    except sqlite3.IntegrityError as e:
+        return False, f"Booking conflict: {e}", None
+
+    # emails (confirmation)
+    try:
+        send_confirmation_emails({
+            "Salesperson Email": row["salesperson_email"],
+            "Salesperson": row["salesperson_name"],
+            "School": row["school_name"],
+            "Grade": row.get("grade"),
+            "Subject": row["subject"],
+            "Date": row["date"],
+            "Slot": row["slot"],
+            "Type": row["booking_type"],
+            "Topic": row.get("topic"),
+            "Teacher": row["teacher"],
+        })
+    except Exception as e:
+        _elog(f"post-booking email error: {e}")
+
+    return True, f"Booked with {teacher}.", booking_id
+
+# -----------------------------------------------------------------------------
+# Email system (UTF-8 safe, logging, resend)
+# -----------------------------------------------------------------------------
 def _elog(msg: str):
     print(f"[EMAIL] {msg}")
-
-def _norm_key(name: str) -> str:
-    name = (name or "").upper()
-    return re.sub(r"[^A-Z0-9]+", "_", name).strip("_")
 
 def get_teacher_email(teacher: str) -> str:
     """
     Look up teacher email from [TEACHER_EMAILS] using a normalized key.
-    Includes fallbacks and logs what key was used.
+    Includes fallbacks and logs the key used.
     """
     book = st.secrets.get("TEACHER_EMAILS", {})
     if not teacher:
         _elog("teacher email lookup skipped: empty teacher"); return ""
-
-    key_norm = _norm_key(teacher)          # e.g., "Kalpana Ma'am" -> "KALPANA_MAAM"
+    key_norm = _norm_key(teacher)
     val = book.get(key_norm)
 
     if not val:
@@ -169,7 +295,6 @@ def get_teacher_email(teacher: str) -> str:
         for k in alt_keys:
             if k in book:
                 val = book[k]; key_norm = k; break
-
     if not val:
         lower_map = {k.lower(): v for k, v in book.items()}
         val = lower_map.get(key_norm.lower(), "")
@@ -177,7 +302,6 @@ def get_teacher_email(teacher: str) -> str:
     if not val:
         _elog(f"teacher email missing for key={key_norm} (teacher='{teacher}')")
         return ""
-
     _elog(f"teacher email found for key={key_norm} -> {val}")
     return val
 
@@ -210,7 +334,7 @@ def _smtp_send(to_addr: str, subject: str, body: str) -> None:
     msg = EmailMessage()
     msg["From"] = user
     msg["To"] = to_addr
-    msg["Subject"] = subject           # emojis OK
+    msg["Subject"] = subject
     msg.set_content(body, subtype="plain", charset="utf-8")
 
     last_err = None
@@ -233,16 +357,15 @@ def _smtp_send(to_addr: str, subject: str, body: str) -> None:
         except Exception as e:
             last_err = str(e)
             _elog(f"FAIL try {attempt} to={to_addr}: {e}")
-
     _log_email(to_addr, subject, "failed", last_err)
 
-# persistent executor
+# persistent executor (for async confirmations)
 @st.cache_resource
 def get_mail_executor() -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=4)
 
 def _email_sync_mode() -> bool:
-    # Default ON for reliability; set EMAIL_SYNC="false" to queue async
+    # Default ON for reliability; set EMAIL_SYNC="false" in secrets to queue async
     return str(st.secrets.get("EMAIL_SYNC", "true")).lower() == "true"
 
 def _send_async(to_addr: str, subject: str, body: str):
@@ -290,6 +413,7 @@ def send_confirmation_emails(booking: Dict[str, Any]) -> None:
             f"Salesperson: {sp_name}\nSalesperson Email: {sp_email}\n")
 
 def send_cancellation_emails(booking: Dict[str, Any]) -> None:
+    """Send cancellation emails synchronously (inline) to avoid losing them on rerun."""
     def g(CAPS: str, form: str) -> Any:
         return booking.get(CAPS) if CAPS in booking else booking.get(form)
 
@@ -302,19 +426,25 @@ def send_cancellation_emails(booking: Dict[str, Any]) -> None:
     slot     = g("Slot","slot")
     teacher  = g("Teacher","teacher")
 
-    _send_async(sp_email, "❌ Cordova Class Cancelled",
+    _smtp_send(
+        sp_email,
+        "❌ Cordova Class Cancelled",
         f"Dear {sp_name},\n\nYour scheduled class has been cancelled.\n\n"
-        f"School: {school}\nGrade: {grade}\nSubject: {subj}\nDate: {day}\nSlot: {slot}\n")
+        f"School: {school}\nGrade: {grade}\nSubject: {subj}\nDate: {day}\nSlot: {slot}\n"
+    )
 
     t_email = get_teacher_email(teacher)
     if t_email:
-        _send_async(t_email, "❌ Cordova Session Cancelled",
+        _smtp_send(
+            t_email,
+            "❌ Cordova Session Cancelled",
             "Your assigned session has been cancelled.\n\n"
-            f"Subject: {subj}\nDate: {day}\nSlot: {slot}\nSchool: {school}\nGrade: {grade}\n")
+            f"Subject: {subj}\nDate: {day}\nSlot: {slot}\nSchool: {school}\nGrade: {grade}\n"
+        )
 
-# -------------------------------
-# Email log APIs (Admin → Analytics)
-# -------------------------------
+# -----------------------------------------------------------------------------
+# Email log APIs (Admin → Email tab)
+# -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=60)
 def get_email_events(limit: int = 200):
     cur = _exec(
@@ -332,9 +462,9 @@ def resend_email(event_id: int):
     to_addr, subject = row
     _smtp_send(to_addr, subject, f"[RESEND] This is a resend attempt for '{subject}'.")
 
-# -------------------------------
+# -----------------------------------------------------------------------------
 # Teacher Unavailability (shared DB + ensure table)
-# -------------------------------
+# -----------------------------------------------------------------------------
 def _ensure_unavailability_table() -> None:
     _exec("""
         CREATE TABLE IF NOT EXISTS teacher_unavailability (
