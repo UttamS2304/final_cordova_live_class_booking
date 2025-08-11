@@ -16,6 +16,13 @@ initialize_database()
 
 DB_PATH = "cordova_publication.db"
 
+from concurrent.futures import ThreadPoolExecutor
+
+@st.cache_resource
+def get_mail_executor() -> ThreadPoolExecutor:
+    # Lives across reruns, threads are non-daemon
+    return ThreadPoolExecutor(max_workers=4)
+
 # =========================
 # Connection & Query Helpers
 # =========================
@@ -186,8 +193,16 @@ def _smtp_send(to_addr: str, subject: str, body: str) -> None:
         except Exception:
             pass
 
-def _send_async(to_addr: str, subject: str, body: str) -> None:
-    threading.Thread(target=_smtp_send, args=(to_addr, subject, body), daemon=True).start()
+def _send_async(to_addr: str, subject: str, body: str):
+    # Submit to a persistent pool so it keeps running after reruns
+    try:
+        get_mail_executor().submit(_smtp_send, to_addr, subject, body)
+    except Exception as e:
+        try:
+            st.warning(f"Email queueing failed for {to_addr}: {e}")
+        except Exception:
+            pass
+
 
 # -------------------------
 # Public Email Entry Points
@@ -244,3 +259,4 @@ def send_cancellation_emails(booking: Dict[str, Any]) -> None:
     _send_async(get_teacher_email(teacher), "❌ Cordova Session Cancelled",
         "Your assigned session has been cancelled.\n\n"
         f"Subject: {subj}\nDate: {day}\nSlot: {slot}\nSchool: {school}\nGrade: {grade}\n")
+
