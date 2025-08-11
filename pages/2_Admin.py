@@ -1,3 +1,5 @@
+# pages/2_Admin.py — FINAL (no st.modal, version-safe confirms)
+
 import streamlit as st
 from datetime import date
 
@@ -19,7 +21,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -------- Admin Gate --------
-def admin_logged_in(): return st.session_state.get("role") == "admin"
+def admin_logged_in(): 
+    return st.session_state.get("role") == "admin"
 
 def admin_login_form():
     st.title("Admin Login")
@@ -45,7 +48,9 @@ tab_view, tab_unavail, tab_analytics = st.tabs(
     ["📋 View & Delete Bookings", "🧑‍🏫 Teacher Unavailability", "📈 Analytics (Coming Soon)"]
 )
 
-# ========== View & Delete ==========
+# =======================
+# 📋 View & Delete
+# =======================
 with tab_view:
     rows = get_all_bookings()
     if not rows:
@@ -85,6 +90,7 @@ with tab_view:
 
         st.divider()
         st.subheader("Delete a Booking")
+
         if fdf.empty:
             st.info("No rows to delete based on current filters.")
         else:
@@ -96,33 +102,34 @@ with tab_view:
             chosen_id = int(choice.split(" | ", 1)[0])
             chosen_row = fdf[fdf["id"] == chosen_id].iloc[0].to_dict()
 
-           # --- Delete a Booking (version-safe confirm panel, no st.modal) ---
-confirm_key = "confirm_delete_open"
-if st.button("Delete Booking ❌", type="primary"):
-    st.session_state[confirm_key] = True
+            # --- Inline confirmation (no st.modal) ---
+            confirm_key = "confirm_delete_open"
+            if st.button("Delete Booking ❌", type="primary"):
+                st.session_state[confirm_key] = True
 
-if st.session_state.get(confirm_key):
-    st.warning("This will delete the booking and trigger cancellation emails.")
-    st.json({k: chosen_row[k] for k in ["School","Subject","Date","Slot","Teacher","Salesperson"]})
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Yes, delete", type="primary", use_container_width=True, key="confirm_del_yes"):
-            try:
-                send_cancellation_emails(chosen_row)  # emails first
-                delete_booking(chosen_id)
-                st.session_state[confirm_key] = False
-                st.success("Booking deleted and cancellation emails triggered.")
-                st.rerun()
-            except Exception as e:
-                st.session_state[confirm_key] = False
-                st.exception(e)
-    with c2:
-        if st.button("Cancel", use_container_width=True, key="confirm_del_no"):
-            st.session_state[confirm_key] = False
-            st.info("Deletion cancelled.")
+            if st.session_state.get(confirm_key):
+                st.warning("This will delete the booking and trigger cancellation emails.")
+                st.json({k: chosen_row[k] for k in ["School","Subject","Date","Slot","Teacher","Salesperson"]})
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("Yes, delete", type="primary", use_container_width=True, key="confirm_del_yes"):
+                        try:
+                            send_cancellation_emails(chosen_row)  # emails first
+                            delete_booking(chosen_id)
+                            st.session_state[confirm_key] = False
+                            st.success("Booking deleted and cancellation emails triggered.")
+                            st.rerun()
+                        except Exception as e:
+                            st.session_state[confirm_key] = False
+                            st.exception(e)
+                with c2:
+                    if st.button("Cancel", use_container_width=True, key="confirm_del_no"):
+                        st.session_state[confirm_key] = False
+                        st.info("Deletion cancelled.")
 
-
-# ========== Teacher Unavailability ==========
+# =======================
+# 🧑‍🏫 Unavailability
+# =======================
 with tab_unavail:
     st.subheader("Mark Teacher Unavailable")
 
@@ -176,15 +183,33 @@ with tab_unavail:
         labels = [f"{r['id']} | {r['Teacher']} | {r['Date']} | {r['Slot'] or 'Full Day'}" for r in urows]
         to_remove = st.selectbox("Remove entry", labels, key="unavail_pick")
         unavail_id = int(to_remove.split(" | ", 1)[0])
-        if st.button("Unmark (Delete Entry) ✅"):
-            try:
-                delete_unavailability(unavail_id)
-                st.success("Unavailability removed.")
-                st.rerun()
-            except Exception as e:
-                st.exception(e)
 
-# ========== Analytics placeholder ==========
+        # --- Inline confirmation (no st.modal) ---
+        u_confirm_key = "confirm_unavail_delete_open"
+        if st.button("Unmark (Delete Entry) ✅"):
+            st.session_state[u_confirm_key] = True
+
+        if st.session_state.get(u_confirm_key):
+            st.warning("Remove this unavailability entry?")
+            st.write(to_remove)
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Yes, remove", type="primary", use_container_width=True, key="u_confirm_yes"):
+                    try:
+                        delete_unavailability(unavail_id)
+                        st.session_state[u_confirm_key] = False
+                        st.success("Unavailability removed.")
+                        st.rerun()
+                    except Exception as e:
+                        st.session_state[u_confirm_key] = False
+                        st.exception(e)
+            with c2:
+                if st.button("Cancel", use_container_width=True, key="u_confirm_no"):
+                    st.session_state[u_confirm_key] = False
+                    st.info("Removal cancelled.")
+
+# =======================
+# 📈 Analytics (placeholder)
+# =======================
 with tab_analytics:
     st.info("Charts coming soon.")
-
