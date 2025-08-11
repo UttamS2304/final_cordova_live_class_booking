@@ -46,7 +46,8 @@ with col2:
 st.markdown("<hr style='opacity:.15; margin-top: 24px;'>", unsafe_allow_html=True)
 st.markdown(
     "<div style='text-align:center; color:#9aa0a6; font-size:12px;'>"
-    "© 2025 Cordova Publication. All rights reserved."
+    "© Made by Uttam for Cordova Publication 2025. All rights reserved."
     "</div>",
     unsafe_allow_html=True,
 )
+
