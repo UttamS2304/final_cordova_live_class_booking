@@ -305,3 +305,39 @@ def resend_email(event_id: int):
         return
     to_addr, subject = row
     _smtp_send(to_addr, subject, f"[RESEND] This is a resend attempt for '{subject}'.")
+
+# === Teacher Unavailability Functions ===
+
+import sqlite3
+from pathlib import Path
+
+DB_PATH = Path(__file__).parent / "bookings.db"
+
+def mark_unavailable(teacher: str, date_str: str, slot: str | None):
+    """Mark a teacher unavailable for a specific day or slot."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO teacher_unavailability (teacher, date, slot)
+        VALUES (?, ?, ?)
+    """, (teacher, date_str, slot))
+    conn.commit()
+    conn.close()
+
+def list_unavailability():
+    """Return all unavailability entries as a list of dicts."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM teacher_unavailability ORDER BY date DESC")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+def delete_unavailability(unavail_id: int):
+    """Remove an unavailability entry by ID."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM teacher_unavailability WHERE id = ?", (unavail_id,))
+    conn.commit()
+    conn.close()
