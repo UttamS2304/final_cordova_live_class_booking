@@ -96,21 +96,31 @@ with tab_view:
             chosen_id = int(choice.split(" | ", 1)[0])
             chosen_row = fdf[fdf["id"] == chosen_id].iloc[0].to_dict()
 
-            if st.button("Delete Booking ❌", type="primary"):
-                with st.modal("Confirm deletion"):
-                    st.json({k: chosen_row[k] for k in ["School","Subject","Date","Slot","Teacher","Salesperson"]})
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if st.button("Yes, delete", type="primary", use_container_width=True, key="confirm_del"):
-                            try:
-                                send_cancellation_emails(chosen_row)  # emails first
-                                delete_booking(chosen_id)
-                                st.success("Booking deleted and cancellation emails triggered.")
-                                st.rerun()
-                            except Exception as e:
-                                st.exception(e)
-                    with c2:
-                        st.button("Cancel", use_container_width=True, key="cancel_del")
+           # --- Delete a Booking (version-safe confirm panel, no st.modal) ---
+confirm_key = "confirm_delete_open"
+if st.button("Delete Booking ❌", type="primary"):
+    st.session_state[confirm_key] = True
+
+if st.session_state.get(confirm_key):
+    st.warning("This will delete the booking and trigger cancellation emails.")
+    st.json({k: chosen_row[k] for k in ["School","Subject","Date","Slot","Teacher","Salesperson"]})
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Yes, delete", type="primary", use_container_width=True, key="confirm_del_yes"):
+            try:
+                send_cancellation_emails(chosen_row)  # emails first
+                delete_booking(chosen_id)
+                st.session_state[confirm_key] = False
+                st.success("Booking deleted and cancellation emails triggered.")
+                st.rerun()
+            except Exception as e:
+                st.session_state[confirm_key] = False
+                st.exception(e)
+    with c2:
+        if st.button("Cancel", use_container_width=True, key="confirm_del_no"):
+            st.session_state[confirm_key] = False
+            st.info("Deletion cancelled.")
+
 
 # ========== Teacher Unavailability ==========
 with tab_unavail:
@@ -177,3 +187,4 @@ with tab_unavail:
 # ========== Analytics placeholder ==========
 with tab_analytics:
     st.info("Charts coming soon.")
+
