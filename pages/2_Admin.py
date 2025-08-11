@@ -142,21 +142,43 @@ with tab_view:
 # =======================
 with tab_unavail:
     st.subheader("Mark Teacher Unavailable")
-    from backend import get_all_bookings as _all  # lazy
-    rows_for_teachers = _all()
-    teacher_options = sorted({r["Teacher"] for r in rows_for_teachers}) if rows_for_teachers else []
-    colA, colB, colC = st.columns(3)
-    pick = colA.selectbox("Teacher", teacher_options + ["(Type name manually)"])
-    manual = colA.text_input("Or type teacher name", value="") if pick == "(Type name manually)" else ""
-    day = colB.date_input("Date", value=date.today(), format="YYYY-MM-DD")
-    slot = colC.selectbox("Slot (optional = full day)", ["(Full Day)",
-        "10:00–10:40","10:40–11:20","11:20–12:00","12:20–13:00",
-        "13:00–13:40","13:40–14:20","14:20–15:00","15:00–15:40"
-    ])
 
-    chosen_teacher = manual.strip() if manual else pick
+    # --- Build teacher list from mapping + bookings + secrets ---
+    from teacher_mapping import TEACHER_MAP
+    all_from_map = {t for lst in TEACHER_MAP.values() for t in lst}
+
+    rows_for_teachers = get_all_bookings()
+    all_from_bookings = {r["Teacher"] for r in rows_for_teachers} if rows_for_teachers else set()
+
+    # Convert TEACHER_EMAILS keys like KALPANA_MAAM -> "Kalpana Ma'am"
+    def prettify_key(k: str) -> str:
+        s = k.upper()
+        s = s.replace("_MAAM", " Ma'am").replace("_SIR", " Sir")
+        s = s.replace("_", " ").title().replace("Ma'am", "Ma'am")  # fix titlecase apostrophe
+        return s
+
+    all_from_secrets = set()
+    for k in st.secrets.get("TEACHER_EMAILS", {}).keys():
+        all_from_secrets.add(prettify_key(k))
+
+    teacher_options = sorted(all_from_map | all_from_bookings | all_from_secrets)
+
+    # --- UI controls ---
+    colA, colB, colC = st.columns(3)
+    teacher = colA.selectbox("Teacher", ["— Select teacher —"] + teacher_options + ["(Type name manually)"])
+    manual  = colA.text_input("Or type teacher name", value="") if teacher == "(Type name manually)" else ""
+    day     = colB.date_input("Date", value=date.today(), format="YYYY-MM-DD")
+    slot    = colC.selectbox(
+        "Slot (optional = full day)",
+        ["(Full Day)",
+         "10:00–10:40","10:40–11:20","11:20–12:00",
+         "12:20–13:00","13:00–13:40","13:40–14:20",
+         "14:20–15:00","15:00–15:40"]
+    )
+
+    chosen_teacher = (manual.strip() if teacher == "(Type name manually)" else teacher)
     if st.button("Mark Unavailable", type="primary"):
-        if not chosen_teacher or chosen_teacher == "(Type name manually)":
+        if (not chosen_teacher) or (chosen_teacher == "— Select teacher —") or (chosen_teacher == "(Type name manually)" and not manual.strip()):
             st.error("Please select or type a teacher name.")
         else:
             try:
@@ -197,3 +219,4 @@ with tab_analytics:
 
 st.markdown("<hr style='opacity:.2'>", unsafe_allow_html=True)
 st.caption("Made by Utt@m for Cordova Publications 2025")
+
