@@ -1,10 +1,11 @@
-# backend.py — MAIL-ROBUST FINAL
+# backend.py — MAIL-ROBUST FINAL (clean)
 
 from __future__ import annotations
 import sqlite3, re, smtplib, ssl
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor
+from email.message import EmailMessage
 
 import streamlit as st
 from init_db import initialize_database
@@ -16,7 +17,7 @@ from teacher_mapping import candidates_for_subject
 initialize_database()
 DB_PATH = "cordova_publication.db"
 
-def _ensure_email_log_table():
+def _ensure_email_log_table() -> None:
     try:
         with sqlite3.connect(DB_PATH) as conn:
             conn.executescript("""
@@ -148,12 +149,37 @@ def _norm_key(name: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "_", name).strip("_")
 
 def get_teacher_email(teacher: str) -> str:
+    """
+    Look up teacher email from [TEACHER_EMAILS] using a normalized key.
+    Includes fallbacks and logs what key was used.
+    """
     book = st.secrets.get("TEACHER_EMAILS", {})
-    key  = _norm_key(teacher)
-    addr = book.get(key, "")
-    if not addr:
-        _elog(f"teacher email missing for key={key} (teacher={teacher}) — skipping teacher mail")
-    return addr
+    if not teacher:
+        _elog("teacher email lookup skipped: empty teacher"); return ""
+
+    key_norm = _norm_key(teacher)          # e.g., "Kalpana Ma'am" -> "KALPANA_MAAM"
+    val = book.get(key_norm)
+
+    if not val:
+        alt_keys = {
+            key_norm.replace("MAAM", "MAM"),
+            key_norm.replace("MA_AM", "MAAM"),
+            key_norm.replace("__", "_"),
+        }
+        for k in alt_keys:
+            if k in book:
+                val = book[k]; key_norm = k; break
+
+    if not val:
+        lower_map = {k.lower(): v for k, v in book.items()}
+        val = lower_map.get(key_norm.lower(), "")
+
+    if not val:
+        _elog(f"teacher email missing for key={key_norm} (teacher='{teacher}')")
+        return ""
+
+    _elog(f"teacher email found for key={key_norm} -> {val}")
+    return val
 
 def _log_email(to_addr: str, subject: str, status: str, error: str | None = None):
     try:
@@ -165,13 +191,7 @@ def _log_email(to_addr: str, subject: str, status: str, error: str | None = None
     except Exception as e:
         print(f"[EMAIL][LOG-FAIL] {e}")
 
-def _secrets_ok() -> bool:
-    req = ("EMAIL_HOST","EMAIL_PORT","EMAIL_USER","EMAIL_PASS")
-    return all(st.secrets.get(k) for k in req)
-
-# Core SMTP with one retry + DB logging
-from email.message import EmailMessage
-
+# Core SMTP with one retry + DB logging (UTF-8 safe)
 def _smtp_send(to_addr: str, subject: str, body: str) -> None:
     if not to_addr:
         _elog("skip: empty to_addr"); return
@@ -187,11 +207,10 @@ def _smtp_send(to_addr: str, subject: str, body: str) -> None:
         _log_email(to_addr, subject, "failed", "incomplete secrets")
         return
 
-    # Build a proper MIME message (UTF-8 safe)
     msg = EmailMessage()
     msg["From"] = user
     msg["To"] = to_addr
-    msg["Subject"] = subject  # emojis OK
+    msg["Subject"] = subject           # emojis OK
     msg.set_content(body, subtype="plain", charset="utf-8")
 
     last_err = None
@@ -251,14 +270,14 @@ def send_confirmation_emails(booking: Dict[str, Any]) -> None:
     teacher  = g("Teacher","teacher")
     admin_to = st.secrets.get("ADMIN_EMAIL","")
 
-    _send_async(sp_email, "Your Cordova Class is Confirmed",
+    _send_async(sp_email, "✅ Your Cordova Class is Confirmed",
         f"Dear {sp_name},\n\nYour class has been successfully booked.\n\n"
         f"School: {school}\nGrade: {grade}\nSubject: {subj}\nDate: {day}\n"
         f"Slot: {slot}\nType: {btype}\nTopic: {topic}\n")
 
     t_email = get_teacher_email(teacher)
     if t_email:
-        _send_async(t_email, "New Cordova Session Assigned",
+        _send_async(t_email, "✅ New Cordova Session Assigned",
             "You have a new session to conduct.\n\n"
             f"Subject: {subj}\nDate: {day}\nSlot: {slot}\nSchool: {school}\n"
             f"Grade: {grade}\nType: {btype}\nTopic: {topic}\n")
@@ -287,42 +306,11 @@ def send_cancellation_emails(booking: Dict[str, Any]) -> None:
         f"Dear {sp_name},\n\nYour scheduled class has been cancelled.\n\n"
         f"School: {school}\nGrade: {grade}\nSubject: {subj}\nDate: {day}\nSlot: {slot}\n")
 
- def get_teacher_email(teacher: str) -> str:
-    """
-    Look up teacher email from [TEACHER_EMAILS] using a normalized key.
-    Also try a few fallbacks and log what we looked for.
-    """
-    book = st.secrets.get("TEACHER_EMAILS", {})
-    if not teacher:
-        _elog("teacher email lookup skipped: empty teacher")
-        return ""
-
-    key_norm = _norm_key(teacher)          # e.g., "Kalpana Ma'am" -> "KALPANA_MAAM"
-    val = book.get(key_norm)
-
-    # Fallbacks: sometimes mapping/typos differ
-    if not val:
-        alt_keys = {
-            key_norm.replace("MAAM", "MAM"),
-            key_norm.replace("MA_AM", "MAAM"),
-            key_norm.replace("__", "_"),
-        }
-        for k in alt_keys:
-            if k in book:
-                val = book[k]; key_norm = k; break
-
-    if not val:
-        # Last resort: case-insensitive exact key match
-        lower_map = {k.lower(): v for k, v in book.items()}
-        val = lower_map.get(key_norm.lower(), "")
-
-    if not val:
-        _elog(f"teacher email missing for key={key_norm} (teacher='{teacher}')")
-        return ""
-
-    _elog(f"teacher email found for key={key_norm} -> {val}")
-    return val
-
+    t_email = get_teacher_email(teacher)
+    if t_email:
+        _send_async(t_email, "❌ Cordova Session Cancelled",
+            "Your assigned session has been cancelled.\n\n"
+            f"Subject: {subj}\nDate: {day}\nSlot: {slot}\nSchool: {school}\nGrade: {grade}\n")
 
 # -------------------------------
 # Email log APIs (Admin → Analytics)
@@ -344,12 +332,9 @@ def resend_email(event_id: int):
     to_addr, subject = row
     _smtp_send(to_addr, subject, f"[RESEND] This is a resend attempt for '{subject}'.")
 
-# === Teacher Unavailability Functions ===
-
-# =========================
-# Teacher Unavailability  ✅ uses shared DB + ensures table
-# =========================
-
+# -------------------------------
+# Teacher Unavailability (shared DB + ensure table)
+# -------------------------------
 def _ensure_unavailability_table() -> None:
     _exec("""
         CREATE TABLE IF NOT EXISTS teacher_unavailability (
@@ -359,7 +344,6 @@ def _ensure_unavailability_table() -> None:
           slot TEXT
         );
     """)
-    # helpful index (ok if already exists)
     _exec("CREATE INDEX IF NOT EXISTS idx_unavail_teacher_date ON teacher_unavailability(teacher, date)")
     get_conn().commit()
 
@@ -379,5 +363,3 @@ def delete_unavailability(unavail_id: int) -> None:
     _ensure_unavailability_table()
     _exec("DELETE FROM teacher_unavailability WHERE id=?", (unavail_id,))
     get_conn().commit()
-
-
