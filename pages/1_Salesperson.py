@@ -1,5 +1,5 @@
 import streamlit as st
-st.markdown(HIDE_BRANDING, unsafe_allow_html=True)
+
 
 import streamlit as st
 from datetime import date, timedelta
@@ -141,5 +141,6 @@ if not rows:
     st.info("No bookings found.")
 else:
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
 
 
