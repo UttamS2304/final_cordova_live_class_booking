@@ -1,33 +1,60 @@
-# pages/2_Admin.py — FINAL (Admin + Email Log, no st.modal)
+# pages/2_Admin.py — Admin + Email Log with robust backend import
 
-import sys, os
-# Ensure project root (where backend.py lives) is importable
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-
+from __future__ import annotations
 import streamlit as st
+import sys, os, traceback, importlib.util
+from pathlib import Path
 from datetime import date
 
-from backend import (
+# ---------- Robust import of backend.py ----------
+ROOT = Path(__file__).resolve().parents[1]
+BACKEND_FILE = ROOT / "backend.py"
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+def _bind_from(mod):
     # bookings
-    get_all_bookings, delete_booking,
+    globals()["get_all_bookings"] = mod.get_all_bookings
+    globals()["delete_booking"] = mod.delete_booking
     # unavailability
-    mark_unavailable, list_unavailability, delete_unavailability,
+    globals()["mark_unavailable"] = mod.mark_unavailable
+    globals()["list_unavailability"] = mod.list_unavailability
+    globals()["delete_unavailability"] = mod.delete_unavailability
     # emails
-    send_cancellation_emails, get_email_events, resend_email,
-)
+    globals()["send_cancellation_emails"] = mod.send_cancellation_emails
+    globals()["get_email_events"] = mod.get_email_events
+    globals()["resend_email"] = mod.resend_email
 
+try:
+    import backend as _bk
+    _bind_from(_bk)
+except Exception:
+    try:
+        if BACKEND_FILE.exists():
+            spec = importlib.util.spec_from_file_location("backend", str(BACKEND_FILE))
+            _bk = importlib.util.module_from_spec(spec)
+            sys.modules["backend"] = _bk
+            assert spec.loader is not None
+            spec.loader.exec_module(_bk)
+            _bind_from(_bk)
+        else:
+            raise ImportError(f"backend.py not found at {BACKEND_FILE}")
+    except Exception as e:
+        st.error("Failed to import backend.py. Ensure the file exists in the repo root.")
+        st.code("".join(traceback.format_exception_only(type(e), e)))
+        st.stop()
+
+# ---------- Page config & chrome ----------
 st.set_page_config(page_title="Admin Dashboard", page_icon="🔐", layout="wide")
-
-# Hide Streamlit/GitHub chrome
 st.markdown("""
 <style>
 #MainMenu, footer, header {visibility: hidden;}
 [data-testid="stDecoration"] {display: none;}
-.block-container {padding-top: 1.5rem; padding-bottom: 1.5rem;}
+.block-container {padding-top: 1.25rem; padding-bottom: 1.25rem;}
 </style>
 """, unsafe_allow_html=True)
 
-# ---------------- Admin auth ----------------
+# ---------- Admin auth ----------
 def admin_logged_in():
     return st.session_state.get("role") == "admin"
 
@@ -70,13 +97,11 @@ with tab_view:
         import pandas as pd
         df = pd.DataFrame(rows)
 
-        # Stats
         cA, cB, cC = st.columns(3)
         cA.metric("Total bookings", len(df))
         cB.metric("Unique schools", df["School"].nunique())
         cC.metric("Unique teachers", df["Teacher"].nunique())
 
-        # Filters
         with st.expander("Filters", expanded=False):
             f1, f2, f3, f4 = st.columns(4)
             subj = f1.selectbox("Subject", ["(All)"] + sorted(df["Subject"].dropna().unique().tolist()))
@@ -120,7 +145,6 @@ with tab_view:
             chosen_id = int(choice.split(" | ", 1)[0])
             chosen_row = fdf[fdf["id"] == chosen_id].iloc[0].to_dict()
 
-            # Version-safe inline confirm (no st.modal required)
             confirm_key = "confirm_delete_open"
             if st.button("Delete Booking ❌", type="primary"):
                 st.session_state[confirm_key] = True
@@ -128,12 +152,11 @@ with tab_view:
             if st.session_state.get(confirm_key):
                 st.warning("This will delete the booking and trigger cancellation emails.")
                 st.json({k: chosen_row[k] for k in ["School","Subject","Date","Slot","Teacher","Salesperson"]})
-                cc1, cc2 = st.columns(2)
-                with cc1:
+                c1, c2 = st.columns(2)
+                with c1:
                     if st.button("Yes, delete", type="primary", use_container_width=True, key="confirm_del_yes"):
                         try:
-                            # Send cancellation emails first, then delete
-                            send_cancellation_emails(chosen_row)
+                            send_cancellation_emails(chosen_row)  # send emails first
                             delete_booking(chosen_id)
                             st.session_state[confirm_key] = False
                             st.success("Booking deleted and cancellation emails triggered.")
@@ -141,7 +164,7 @@ with tab_view:
                         except Exception as e:
                             st.session_state[confirm_key] = False
                             st.exception(e)
-                with cc2:
+                with c2:
                     if st.button("Cancel", use_container_width=True, key="confirm_del_no"):
                         st.session_state[confirm_key] = False
                         st.info("Deletion cancelled.")
@@ -152,15 +175,13 @@ with tab_view:
 with tab_unavail:
     st.subheader("Mark Teacher Unavailable")
 
-    # Build teacher list from mapping + bookings + secrets
     from teacher_mapping import TEACHER_MAP
     all_from_map = {t for lst in TEACHER_MAP.values() for t in lst}
     rows_for_teachers = get_all_bookings()
     all_from_bookings = {r["Teacher"] for r in rows_for_teachers} if rows_for_teachers else set()
 
     def prettify_key(k: str) -> str:
-        s = k.upper()
-        s = s.replace("_MAAM", " Ma'am").replace("_SIR", " Sir").replace("_", " ").title()
+        s = k.upper().replace("_MAAM", " Ma'am").replace("_SIR", " Sir").replace("_", " ").title()
         return s.replace("Ma'Am", "Ma'am")
 
     all_from_secrets = {prettify_key(k) for k in st.secrets.get("TEACHER_EMAILS", {}).keys()}
@@ -202,7 +223,6 @@ with tab_unavail:
         to_remove = st.selectbox("Remove entry", labels, key="unavail_pick")
         unavail_id = int(to_remove.split(" | ", 1)[0])
 
-        # Version-safe inline confirm
         u_confirm_key = "confirm_unavail_delete_open"
         if st.button("Unmark (Delete Entry) ✅"):
             st.session_state[u_confirm_key] = True
@@ -232,7 +252,6 @@ with tab_unavail:
 with tab_email:
     st.subheader("Email Log (latest 200)")
     import pandas as pd
-
     events = get_email_events(200)
     if not events:
         st.info("No email events yet.")
