@@ -1,8 +1,6 @@
 # pages/2_Admin.py — Admin + Email Log with robust backend import
 
 import streamlit as st
-st.markdown(HIDE_BRANDING, unsafe_allow_html=True)
-
 from __future__ import annotations
 import streamlit as st
 import sys, os, traceback, importlib.util
@@ -271,5 +269,6 @@ with tab_email:
                 st.success("Resend queued/sent (check Email Log for new entry).")
             except Exception as e:
                 st.exception(e)
+
 
 
