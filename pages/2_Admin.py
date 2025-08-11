@@ -1,20 +1,5 @@
 # pages/2_Admin.py — Admin + Email Log with robust backend import
-HIDE_BRANDING = """
-<style>
-/* Top-right toolbar (GitHub, Share, etc.) */
-[data-testid="stToolbar"] { display: none !important; }
-/* “Made with Streamlit” footer */
-footer { visibility: hidden; }
-footer:empty { display: none; }
-/* Old menu */
-#MainMenu { visibility: hidden; }
-/* Any explicit GitHub buttons/links Streamlit injects */
-a[href*="github.com"] { display: none !important; }
-button[title="View app source on GitHub"] { display: none !important; }
-/* Status widget / running indicator */
-[data-testid="stStatusWidget"] { display: none !important; }
-</style>
-"""
+
 import streamlit as st
 st.markdown(HIDE_BRANDING, unsafe_allow_html=True)
 
@@ -286,4 +271,5 @@ with tab_email:
                 st.success("Resend queued/sent (check Email Log for new entry).")
             except Exception as e:
                 st.exception(e)
+
 
