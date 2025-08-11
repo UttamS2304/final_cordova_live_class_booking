@@ -308,36 +308,37 @@ def resend_email(event_id: int):
 
 # === Teacher Unavailability Functions ===
 
-import sqlite3
-from pathlib import Path
+# =========================
+# Teacher Unavailability  ✅ uses shared DB + ensures table
+# =========================
 
-DB_PATH = Path(__file__).parent / "bookings.db"
+def _ensure_unavailability_table() -> None:
+    _exec("""
+        CREATE TABLE IF NOT EXISTS teacher_unavailability (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          teacher TEXT NOT NULL,
+          date TEXT NOT NULL,
+          slot TEXT
+        );
+    """)
+    # helpful index (ok if already exists)
+    _exec("CREATE INDEX IF NOT EXISTS idx_unavail_teacher_date ON teacher_unavailability(teacher, date)")
+    get_conn().commit()
 
-def mark_unavailable(teacher: str, date_str: str, slot: str | None):
-    """Mark a teacher unavailable for a specific day or slot."""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO teacher_unavailability (teacher, date, slot)
-        VALUES (?, ?, ?)
-    """, (teacher, date_str, slot))
-    conn.commit()
-    conn.close()
+def mark_unavailable(teacher: str, date: str, slot: Optional[str]) -> None:
+    _ensure_unavailability_table()
+    _exec("INSERT INTO teacher_unavailability (teacher, date, slot) VALUES (?, ?, ?)",
+          (teacher, date, slot))
+    get_conn().commit()
 
-def list_unavailability():
-    """Return all unavailability entries as a list of dicts."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM teacher_unavailability ORDER BY date DESC")
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return rows
+def list_unavailability() -> List[Dict[str, Any]]:
+    _ensure_unavailability_table()
+    cur = _exec("SELECT id, teacher, date, slot FROM teacher_unavailability ORDER BY date DESC")
+    cols = ["id","Teacher","Date","Slot"]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
 
-def delete_unavailability(unavail_id: int):
-    """Remove an unavailability entry by ID."""
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM teacher_unavailability WHERE id = ?", (unavail_id,))
-    conn.commit()
-    conn.close()
+def delete_unavailability(unavail_id: int) -> None:
+    _ensure_unavailability_table()
+    _exec("DELETE FROM teacher_unavailability WHERE id=?", (unavail_id,))
+    get_conn().commit()
+
