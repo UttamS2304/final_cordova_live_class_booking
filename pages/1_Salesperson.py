@@ -5,22 +5,22 @@ import pandas as pd
 from backend import (
     pick_teacher, teacher_busy, exists_booking,
     record_booking, get_bookings_for_salesperson,
-    send_confirmation_emails
+    send_confirmation_emails, is_teacher_unavailable
 )
+from teacher_mapping import candidates_for_subject
 
 st.set_page_config(page_title="Salesperson Portal", page_icon="🧑‍💼", layout="wide")
 
-# Hide Streamlit/UI chrome
+# Hide Streamlit/GitHub chrome
 st.markdown("""
 <style>
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
+#MainMenu, footer, header {visibility: hidden;}
 [data-testid="stDecoration"] {display: none;}
+.block-container {padding-top: 1.5rem; padding-bottom: 1.5rem;}
 </style>
 """, unsafe_allow_html=True)
 
-# -------------- Session Login --------------
+# ---------- Session login ----------
 def salesperson_logged_in():
     return st.session_state.get("role") == "sales" and st.session_state.get("salesperson_email")
 
@@ -39,21 +39,17 @@ def salesperson_login_form():
             st.session_state["salesperson_name"] = name.strip()
             st.session_state["salesperson_number"] = phone.strip()
             st.session_state["salesperson_email"] = email.strip()
-            st.success(f"Welcome, {name}!")
             st.rerun()
 
 if not salesperson_logged_in():
-    salesperson_login_form()
-    st.stop()
+    salesperson_login_form(); st.stop()
 
 with st.sidebar:
     st.caption(f"Logged in as: {st.session_state.get('salesperson_name')}")
     if st.button("Logout", use_container_width=True):
-        st.session_state.clear()
-        st.success("Logged out.")
-        st.rerun()
+        st.session_state.clear(); st.rerun()
 
-# -------------- Constants --------------
+# ---------- Constants ----------
 TODAY = date.today()
 MAX_DAY = TODAY + timedelta(days=60)
 
@@ -63,44 +59,38 @@ SUBJECTS = ["— Select subject —","Hindi","Mathematics","GK","SST","Science",
 CURRICULA = ["— Select curriculum —","CBSE","ICSE","State Board","Other"]
 BOOKING_TYPES = ["Live Class","Product Training"]
 
-# -------------- Booking Form --------------
+# ---------- Form ----------
 st.title("📅 Create a Booking")
-
 with st.form("booking_form", clear_on_submit=False):
     col1, col2 = st.columns(2)
     with col1:
         booking_type = st.selectbox("Booking Type", BOOKING_TYPES, index=0)
-        school_name  = st.text_input("School Name", placeholder="e.g., Springdale Public School")
-        title_used   = st.text_input("Title Used by School", placeholder="e.g., Cordova EVS Series")
+        school_name  = st.text_input("School Name")
+        title_used   = st.text_input("Title Used by School")
         curriculum   = st.selectbox("Curriculum", CURRICULA, index=0)
         subject      = st.selectbox("Subject", SUBJECTS, index=0)
         picked_date  = st.date_input("Date", value=TODAY, min_value=TODAY, max_value=MAX_DAY, format="YYYY-MM-DD")
         slot         = st.selectbox("Slot", SLOTS, index=0)
     with col2:
-        grade = st.text_input("Grade (Live Class only)", placeholder="e.g., 3") if booking_type == "Live Class" else None
-        topic = st.text_input("Topic (optional)", placeholder="e.g., Fractions basics / Reading practice")
+        grade = st.text_input("Grade (Live Class only)") if booking_type == "Live Class" else None
+        topic = st.text_input("Topic (optional)")
         st.text_input("Salesperson Name", value=st.session_state["salesperson_name"], disabled=True)
         st.text_input("Salesperson Number", value=st.session_state["salesperson_number"], disabled=True)
         st.text_input("Salesperson Email", value=st.session_state["salesperson_email"], disabled=True)
-
     submit = st.form_submit_button("Book Session", type="primary")
 
-# Availability hint (nice touch)
-from teacher_mapping import candidates_for_subject
-from backend import is_teacher_unavailable
+# Availability hint
 if subject != SUBJECTS[0] and slot != SLOTS[0]:
     tlist = candidates_for_subject(subject)
     if tlist:
         unavailable = [t for t in tlist if is_teacher_unavailable(t, str(picked_date), slot)]
         available   = [t for t in tlist if t not in unavailable]
         if available:
-            st.success(f"Likely teacher: {available[0]} (others free: {', '.join(available[1:]) or '—'})")
+            st.success(f"Likely teacher: {available[0]}")
         else:
             st.error("All mapped teachers are unavailable for this slot.")
 
-# -------------- Submit --------------
-def invalid(msg: str) -> bool:
-    st.error(msg); return True
+def invalid(msg: str): st.error(msg); return True
 
 if submit:
     if not school_name.strip(): invalid("School Name is required.")
@@ -135,7 +125,7 @@ if submit:
             }
             try:
                 record_booking(data)
-                send_confirmation_emails(data)
+                send_confirmation_emails(data)   # <-- emails queued/sent before rerun
                 st.success(f"✅ Booked! Teacher: {teacher} | {subject} | {data['date']} {slot}")
                 st.rerun()
             except Exception as e:
@@ -143,11 +133,8 @@ if submit:
 
 st.divider()
 st.subheader("📋 My Bookings")
-my_rows = get_bookings_for_salesperson(st.session_state["salesperson_email"])
-if not my_rows:
+rows = get_bookings_for_salesperson(st.session_state["salesperson_email"])
+if not rows:
     st.info("No bookings found.")
 else:
-    st.dataframe(pd.DataFrame(my_rows), use_container_width=True, hide_index=True)
-
-st.markdown("<hr style='opacity:.2'>", unsafe_allow_html=True)
-st.caption("Made by Utt@m for Cordova Publications 2025")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
