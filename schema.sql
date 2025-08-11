@@ -38,3 +38,16 @@ ON bookings (school_name, subject, date, slot);
 -- Prevent teacher double-booking in a slot
 CREATE UNIQUE INDEX IF NOT EXISTS uniq_teacher_slot
 ON bookings (teacher, date, slot);
+
+-- Email event log (for debugging + resend)
+CREATE TABLE IF NOT EXISTS email_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  to_addr TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  status TEXT NOT NULL,   -- 'sent' | 'failed'
+  error TEXT              -- nullable
+);
+
+CREATE INDEX IF NOT EXISTS idx_email_ts ON email_events(ts);
+
