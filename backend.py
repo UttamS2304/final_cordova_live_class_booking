@@ -170,14 +170,11 @@ def _secrets_ok() -> bool:
     return all(st.secrets.get(k) for k in req)
 
 # Core SMTP with one retry + DB logging
+from email.message import EmailMessage
+
 def _smtp_send(to_addr: str, subject: str, body: str) -> None:
     if not to_addr:
         _elog("skip: empty to_addr"); return
-
-    if not _secrets_ok():
-        _elog("skip: incomplete secrets")
-        _log_email(to_addr, subject, "failed", "incomplete secrets")
-        return
 
     host = st.secrets.get("EMAIL_HOST", "smtp.gmail.com")
     port = int(st.secrets.get("EMAIL_PORT", 587))
@@ -185,9 +182,19 @@ def _smtp_send(to_addr: str, subject: str, body: str) -> None:
     pwd  = st.secrets.get("EMAIL_PASS", "")
     use_tls = str(st.secrets.get("EMAIL_USE_TLS", "true")).lower() == "true"
 
-    msg = f"Subject: {subject}\r\nFrom: {user}\r\nTo: {to_addr}\r\n\r\n{body}"
-    last_err = None
+    if not (host and port and user and pwd):
+        _elog("skip: incomplete secrets")
+        _log_email(to_addr, subject, "failed", "incomplete secrets")
+        return
 
+    # Build a proper MIME message (UTF-8 safe)
+    msg = EmailMessage()
+    msg["From"] = user
+    msg["To"] = to_addr
+    msg["Subject"] = subject  # emojis OK
+    msg.set_content(body, subtype="plain", charset="utf-8")
+
+    last_err = None
     for attempt in (1, 2):
         try:
             _elog(f"sending (try {attempt}) → to={to_addr}, host={host}:{port}, tls={use_tls}")
@@ -195,12 +202,12 @@ def _smtp_send(to_addr: str, subject: str, body: str) -> None:
                 with smtplib.SMTP(host, port, timeout=12) as s:
                     s.starttls(context=ssl.create_default_context())
                     s.login(user, pwd)
-                    s.sendmail(user, [to_addr], msg)
+                    s.send_message(msg)
             else:
                 ssl_port = 465 if port == 587 else port
                 with smtplib.SMTP_SSL(host, ssl_port, timeout=12) as s:
                     s.login(user, pwd)
-                    s.sendmail(user, [to_addr], msg)
+                    s.send_message(msg)
             _elog(f"sent ✓ to={to_addr}")
             _log_email(to_addr, subject, "sent", None)
             return
@@ -244,14 +251,14 @@ def send_confirmation_emails(booking: Dict[str, Any]) -> None:
     teacher  = g("Teacher","teacher")
     admin_to = st.secrets.get("ADMIN_EMAIL","")
 
-    _send_async(sp_email, "✅ Your Cordova Class is Confirmed",
+    _send_async(sp_email, "Your Cordova Class is Confirmed",
         f"Dear {sp_name},\n\nYour class has been successfully booked.\n\n"
         f"School: {school}\nGrade: {grade}\nSubject: {subj}\nDate: {day}\n"
         f"Slot: {slot}\nType: {btype}\nTopic: {topic}\n")
 
     t_email = get_teacher_email(teacher)
     if t_email:
-        _send_async(t_email, "✅ New Cordova Session Assigned",
+        _send_async(t_email, "New Cordova Session Assigned",
             "You have a new session to conduct.\n\n"
             f"Subject: {subj}\nDate: {day}\nSlot: {slot}\nSchool: {school}\n"
             f"Grade: {grade}\nType: {btype}\nTopic: {topic}\n")
@@ -280,11 +287,42 @@ def send_cancellation_emails(booking: Dict[str, Any]) -> None:
         f"Dear {sp_name},\n\nYour scheduled class has been cancelled.\n\n"
         f"School: {school}\nGrade: {grade}\nSubject: {subj}\nDate: {day}\nSlot: {slot}\n")
 
-    t_email = get_teacher_email(teacher)
-    if t_email:
-        _send_async(t_email, "❌ Cordova Session Cancelled",
-            "Your assigned session has been cancelled.\n\n"
-            f"Subject: {subj}\nDate: {day}\nSlot: {slot}\nSchool: {school}\nGrade: {grade}\n")
+ def get_teacher_email(teacher: str) -> str:
+    """
+    Look up teacher email from [TEACHER_EMAILS] using a normalized key.
+    Also try a few fallbacks and log what we looked for.
+    """
+    book = st.secrets.get("TEACHER_EMAILS", {})
+    if not teacher:
+        _elog("teacher email lookup skipped: empty teacher")
+        return ""
+
+    key_norm = _norm_key(teacher)          # e.g., "Kalpana Ma'am" -> "KALPANA_MAAM"
+    val = book.get(key_norm)
+
+    # Fallbacks: sometimes mapping/typos differ
+    if not val:
+        alt_keys = {
+            key_norm.replace("MAAM", "MAM"),
+            key_norm.replace("MA_AM", "MAAM"),
+            key_norm.replace("__", "_"),
+        }
+        for k in alt_keys:
+            if k in book:
+                val = book[k]; key_norm = k; break
+
+    if not val:
+        # Last resort: case-insensitive exact key match
+        lower_map = {k.lower(): v for k, v in book.items()}
+        val = lower_map.get(key_norm.lower(), "")
+
+    if not val:
+        _elog(f"teacher email missing for key={key_norm} (teacher='{teacher}')")
+        return ""
+
+    _elog(f"teacher email found for key={key_norm} -> {val}")
+    return val
+
 
 # -------------------------------
 # Email log APIs (Admin → Analytics)
@@ -341,4 +379,5 @@ def delete_unavailability(unavail_id: int) -> None:
     _ensure_unavailability_table()
     _exec("DELETE FROM teacher_unavailability WHERE id=?", (unavail_id,))
     get_conn().commit()
+
 
