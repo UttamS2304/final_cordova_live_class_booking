@@ -1,50 +1,42 @@
-# Dashboard.py — professional landing (pure Streamlit, fast)
+# Dashboard.py — minimal professional landing
 
 import streamlit as st
 
 st.set_page_config(page_title="Dashboard", page_icon="🗓️", layout="wide")
 
-# Hide Streamlit chrome (menu/footer/GitHub)
+# Hide Streamlit/GitHub chrome
 st.markdown("""
 <style>
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
+#MainMenu, footer, header {visibility: hidden;}
 [data-testid="stDecoration"] {display: none;}
+/* tighten page */
+.block-container {padding-top: 1.5rem; padding-bottom: 1.5rem;}
+/* buttons */
+button[kind="primary"] {font-weight: 600;}
 </style>
 """, unsafe_allow_html=True)
 
 # Header
-st.title("CORDOVA PUBLICATIONS")
-st.caption("Live Classes & Product Training Booking Portal")
+st.markdown(
+    "<h1 style='margin:0'>CORDOVA PUBLICATIONS</h1>"
+    "<div style='color:#6b7280; margin-bottom:1.25rem'>Session Booking Portal</div>",
+    unsafe_allow_html=True,
+)
 
-# Cards row
-left, right = st.columns(2, gap="large")
+col1, col2 = st.columns(2, gap="large")
 
-with left:
-    st.container(border=True)
-    st.subheader("📚 Salesperson Portal")
-    st.write("Book **Live Classes** or **Product Training** and view your **My Bookings**.")
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("Go to Salesperson Portal ➜", use_container_width=True):
+with col1:
+    with st.container(border=True):
+        st.subheader("📚 Salesperson Portal", anchor=False)
+        st.caption("Book sessions and view your bookings.")
+        if st.button("Open Salesperson Portal ➜", use_container_width=True):
             if hasattr(st, "switch_page"):
                 st.switch_page("pages/1_Salesperson.py")
-    with c2:
-        st.page_link("pages/1_Salesperson.py", label="Open Salesperson Page", icon="🧑‍💼")
 
-with right:
-    st.container(border=True)
-    st.subheader("🛠️ Admin Dashboard")
-    st.write("View & filter all bookings, delete sessions (with emails), and manage **Teacher Unavailability**.")
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        if st.button("Go to Admin Dashboard ➜", use_container_width=True):
+with col2:
+    with st.container(border=True):
+        st.subheader("🛠️ Admin Dashboard", anchor=False)
+        st.caption("Manage bookings and teacher availability.")
+        if st.button("Open Admin Dashboard ➜", use_container_width=True):
             if hasattr(st, "switch_page"):
                 st.switch_page("pages/2_Admin.py")
-    with c2:
-        st.page_link("pages/2_Admin.py", label="Open Admin Page", icon="🔐")
-
-st.divider()
-st.caption("Tip: Admin login uses the credentials stored in **Settings → Secrets**.")
-st.caption("Made by Utt@m for Cordova Publications 2025")
