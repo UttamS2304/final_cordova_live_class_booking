@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import sqlite3, re, smtplib, ssl
-from datetime import datetime
+from datetime import datetime, date, time, timedelta
 from typing import Optional, Dict, Any, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
@@ -218,6 +218,35 @@ def attempt_booking(form_data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]
     slot = form_data["slot"]
     subj = form_data["subject"]
 
+    # ----------------------------
+    # NEW: booking window limits
+    # - Must book at least 1 day before the session date
+    # - Bookings allowed only before 02:00 PM (current day)
+    # ----------------------------
+    # Parse session date robustly
+    if isinstance(day, datetime):
+        session_date = day.date()
+    elif isinstance(day, date):
+        session_date = day
+    else:
+        # Accept ISO formats like "YYYY-MM-DD" or "YYYY-MM-DD HH:MM:SS"
+        try:
+            session_date = datetime.fromisoformat(str(day)).date()
+        except ValueError:
+            session_date = datetime.strptime(str(day), "%Y-%m-%d").date()
+
+    now = datetime.now()
+    today = now.date()
+
+    # Must be at least 1 day in advance (no same-day or past bookings)
+    if session_date <= today:
+        return False, "❌ Sessions can only be booked at least one day in advance.", None
+
+    # Only allow creating bookings before 2:00 PM local time
+    if now.time() > time(14, 0):
+        return False, "❌ New bookings are allowed only before 02:00 PM.", None
+    # ----------------------------
+
     # Parallel capacity
     if count_parallel_on_slot(day, slot) >= MAX_PARALLEL_CLASSES_PER_SLOT:
         return False, "This slot is full. Please choose another time.", None
@@ -259,6 +288,7 @@ def attempt_booking(form_data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]
         _elog(f"post-booking email error: {e}")
 
     return True, f"Booked with {teacher}.", booking_id
+
 
 # -----------------------------------------------------------------------------
 # Email system (UTF-8 safe, logging, resend)
@@ -477,3 +507,4 @@ def delete_unavailability(unavail_id: int) -> None:
     _ensure_unavailability_table()
     _exec("DELETE FROM teacher_unavailability WHERE id=?", (unavail_id,))
     get_conn().commit()
+
