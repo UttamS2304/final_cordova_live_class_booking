@@ -12,9 +12,10 @@ from backend import (
 )
 from teacher_mapping import candidates_for_subject
 
+# ---------------------------------------------------------------------
+# Page setup & light styling
+# ---------------------------------------------------------------------
 st.set_page_config(page_title="Salesperson Portal", page_icon="🧑‍💼", layout="wide")
-
-# ------------- Minimal styling -------------
 st.markdown("""
 <style>
 #MainMenu, footer, header {visibility: hidden;}
@@ -23,7 +24,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ------------- Session / Login -------------
+# ---------------------------------------------------------------------
+# Login
+# ---------------------------------------------------------------------
 def salesperson_logged_in() -> bool:
     return st.session_state.get("role") == "sales" and st.session_state.get("salesperson_email")
 
@@ -54,10 +57,12 @@ with st.sidebar:
         st.session_state.clear()
         st.rerun()
 
-# ------------- Timezone + constants -------------
+# ---------------------------------------------------------------------
+# Timezone & constants
+# ---------------------------------------------------------------------
 TZ = st.secrets.get("TIMEZONE", "Asia/Kolkata")
-local_now = datetime.now(ZoneInfo(TZ))
-TODAY = local_now.date()
+_now = datetime.now(ZoneInfo(TZ))
+TODAY = _now.date()
 TOMORROW = TODAY + timedelta(days=1)
 MAX_DAY = TODAY + timedelta(days=60)
 
@@ -69,7 +74,9 @@ SUBJECTS = ["— Select subject —","Hindi","Mathematics","GK","SST","Science",
 CURRICULA = ["— Select curriculum —","CBSE","ICSE","State Board","Other"]
 BOOKING_TYPES = ["Live Class","Product Training"]
 
-# ------------- Booking Form -------------
+# ---------------------------------------------------------------------
+# Booking form
+# ---------------------------------------------------------------------
 st.title("📅 Create a Booking")
 
 with st.form("booking_form", clear_on_submit=False):
@@ -82,16 +89,15 @@ with st.form("booking_form", clear_on_submit=False):
         curriculum   = st.selectbox("Curriculum", CURRICULA, index=0)
         subject      = st.selectbox("Subject", SUBJECTS, index=0)
 
-        # Date picker: today blocked; tomorrow..max allowed
         picked_date  = st.date_input(
             "Date",
             value=TOMORROW,
-            min_value=TOMORROW,
+            min_value=TOMORROW,           # block today
             max_value=MAX_DAY,
             format="YYYY-MM-DD",
             help="Bookings must be made at least one day in advance."
         )
-        slot         = st.selectbox("Slot", SLOTS, index=0)
+        slot = st.selectbox("Slot", SLOTS, index=0)
 
     with col2:
         grade = st.text_input("Grade (Live Class only)") if booking_type == "Live Class" else None
@@ -100,32 +106,41 @@ with st.form("booking_form", clear_on_submit=False):
         st.text_input("Salesperson Number", value=st.session_state["salesperson_number"], disabled=True)
         st.text_input("Salesperson Email", value=st.session_state["salesperson_email"], disabled=True)
 
-        # --- ONLY block tomorrow after 2 PM (do NOT block day-after-tomorrow) ---
-        delta_days = (picked_date - TODAY).days
-        past_cutoff_for_tomorrow = (delta_days == 1) and (local_now.time() >= time(14, 0))
-        if past_cutoff_for_tomorrow:
+        # ---- ONLY block booking for *tomorrow* after 2 PM local time ----
+        local_now = datetime.now(ZoneInfo(TZ))
+        today = local_now.date()
+
+        # make sure we compare date objects
+        picked_day = picked_date.date() if hasattr(picked_date, "date") else picked_date
+        delta_days = (picked_day - today).days
+        disable_submit = (delta_days == 1) and (local_now.time() >= time(14, 0))
+
+        if disable_submit:
             st.warning("📯 It’s past 02:00 PM today. You can’t book for **tomorrow** anymore. Please choose a later date.")
 
-        # IMPORTANT: submit button is inside the form
-        submit = st.form_submit_button("Book Session", type="primary", disabled=past_cutoff_for_tomorrow)
+        # submit button INSIDE the form (fixes 'missing submit' warning)
+        submit = st.form_submit_button("Book Session", type="primary", disabled=disable_submit)
 
-# ------------- Availability hint (outside the form so it updates live) -------------
+# ---------------------------------------------------------------------
+# Availability hint (outside the form so it refreshes live)
+# ---------------------------------------------------------------------
 if subject != SUBJECTS[0] and slot != SLOTS[0]:
     tlist = candidates_for_subject(subject)
     if tlist:
-        unavailable = [t for t in tlist if is_teacher_unavailable(t, str(picked_date), slot)]
+        unavailable = [t for t in tlist if is_teacher_unavailable(t, picked_date.strftime("%Y-%m-%d"), slot)]
         available   = [t for t in tlist if t not in unavailable]
         if available:
             st.success(f"Likely teacher: {available[0]}")
         else:
             st.error("All mapped teachers are unavailable for this slot.")
 
-# Helper
+# ---------------------------------------------------------------------
+# Submit handling
+# ---------------------------------------------------------------------
 def invalid(msg: str):
     st.error(msg)
     return True
 
-# ------------- Submit handling -------------
 if submit:
     if not school_name.strip():
         invalid("School Name is required.")
@@ -137,13 +152,13 @@ if submit:
         invalid("Please select a slot.")
     elif booking_type == "Live Class" and (not grade or not grade.strip()):
         invalid("Grade is required for Live Class.")
-    elif exists_booking(school_name.strip(), subject, str(picked_date), slot):
+    elif exists_booking(school_name.strip(), subject, picked_date.strftime("%Y-%m-%d"), slot):
         st.warning("A booking already exists for this School, Subject, Date and Slot.")
     else:
-        teacher = pick_teacher(subject, str(picked_date), slot)
+        teacher = pick_teacher(subject, picked_date.strftime("%Y-%m-%d"), slot)
         if not teacher:
             st.error("No teacher available for this subject/date/slot.")
-        elif teacher_busy(teacher, str(picked_date), slot):
+        elif teacher_busy(teacher, picked_date.strftime("%Y-%m-%d"), slot):
             st.error("Selected teacher is already booked in this slot.")
         else:
             data = {
@@ -153,7 +168,7 @@ if submit:
                 "grade": grade.strip() if (booking_type == "Live Class" and grade) else None,
                 "curriculum": curriculum,
                 "subject": subject,
-                "date": picked_date.strftime("%Y-%m-%d"),  # ensure string for backend
+                "date": picked_date.strftime("%Y-%m-%d"),
                 "slot": slot,
                 "topic": (topic or "").strip(),
                 "salesperson_name": st.session_state["salesperson_name"],
@@ -162,7 +177,7 @@ if submit:
                 "teacher": teacher,
             }
             try:
-                ok, msg, _ = record_booking(data)  # backend re-checks date window too
+                ok, msg, _ = record_booking(data)  # backend enforces tomorrow-after-2PM rule too
                 if not ok:
                     st.error(msg)
                 else:
@@ -172,7 +187,9 @@ if submit:
             except Exception as e:
                 st.exception(e)
 
-# ------------- My Bookings -------------
+# ---------------------------------------------------------------------
+# My Bookings (with local-time display for 'Booked On')
+# ---------------------------------------------------------------------
 st.divider()
 st.subheader("📋 My Bookings")
 
@@ -182,13 +199,12 @@ if not rows:
 else:
     df = pd.DataFrame(rows)
 
-    # Pretty-print "Booked On" in local timezone if your column is ISO with offset
+    # Pretty-print "Booked On" using your timezone
     if "Booked On" in df.columns:
         from datetime import datetime as _dt
         def _to_local(ts: str) -> str:
             s = str(ts)
             try:
-                # Accept ISO with offset; if naive, assume UTC then convert
                 if s.endswith("Z"):
                     dt = _dt.fromisoformat(s.replace("Z", "+00:00"))
                 else:
