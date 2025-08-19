@@ -155,39 +155,41 @@ if submit:
 
 st.divider()
 st.subheader("📋 My Bookings")
-
 rows = get_bookings_for_salesperson(st.session_state["salesperson_email"])
-
 if not rows:
     st.info("No bookings found.")
 else:
-    TZ = st.secrets.get("TIMEZONE", "Asia/Kolkata")
-    from zoneinfo import ZoneInfo
-    import pandas as pd
-    from datetime import datetime
-
     df = pd.DataFrame(rows)
 
-    # Normalize/pretty Booked On
-    if "timestamp" in df.columns:
-        def _to_local(ts: str) -> str:
-            try:
-                # If ISO with offset -> respect it
-                dt = datetime.fromisoformat(str(ts))
-                if dt.tzinfo is None:
-                    # Legacy rows without tz: assume UTC, then convert
-                    dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-            except Exception:
-                # Legacy plain "YYYY-mm-dd HH:MM:SS"
-                try:
-                    dt = datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("UTC"))
-                except Exception:
-                    return str(ts)
-            return dt.astimezone(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    TZ = st.secrets.get("TIMEZONE", "Asia/Kolkata")
 
-        df["Booked On"] = df["timestamp"].apply(_to_local)
-        # optional: hide raw column
-        df = df.drop(columns=["timestamp"])
+    def to_local_display(ts) -> str:
+        s = str(ts)
+        try:
+            # Case 1: ISO with 'Z' (UTC) -> convert
+            if s.endswith("Z"):
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            else:
+                # Case 2: ISO maybe with offset
+                dt = datetime.fromisoformat(s)
+                # Case 3: Naive timestamp (no tz) -> assume UTC
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+            return dt.astimezone(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            # Legacy formats: try plain "YYYY-mm-dd HH:MM:SS"
+            try:
+                dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("UTC"))
+                return dt.astimezone(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return s  # give up, show raw
+
+    # Find the booked-on column (support various names)
+    for col in df.columns:
+        key = col.strip().lower().replace("_", " ")
+        if key in {"timestamp", "booked on", "booked on"}:
+            df[col] = df[col].apply(to_local_display)
 
     st.dataframe(df, use_container_width=True, hide_index=True)
-
