@@ -1,7 +1,9 @@
+# salesperson_portal.py
+
 import streamlit as st
-from datetime import datetime, date, time, timedelta
-from zoneinfo import ZoneInfo  # Python 3.9+
 import pandas as pd
+from datetime import datetime, date, time, timedelta
+from zoneinfo import ZoneInfo
 
 from backend import (
     pick_teacher, teacher_busy, exists_booking,
@@ -12,17 +14,17 @@ from teacher_mapping import candidates_for_subject
 
 st.set_page_config(page_title="Salesperson Portal", page_icon="🧑‍💼", layout="wide")
 
-# Hide Streamlit/GitHub chrome
+# ------------- Minimal styling -------------
 st.markdown("""
 <style>
 #MainMenu, footer, header {visibility: hidden;}
 [data-testid="stDecoration"] {display: none;}
-.block-container {padding-top: 1.5rem; padding-bottom: 1.5rem;}
+.block-container {padding-top: 1.2rem; padding-bottom: 1.2rem;}
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Session login ----------
-def salesperson_logged_in():
+# ------------- Session / Login -------------
+def salesperson_logged_in() -> bool:
     return st.session_state.get("role") == "sales" and st.session_state.get("salesperson_email")
 
 def salesperson_login_form():
@@ -43,30 +45,36 @@ def salesperson_login_form():
             st.rerun()
 
 if not salesperson_logged_in():
-    salesperson_login_form(); st.stop()
+    salesperson_login_form()
+    st.stop()
 
 with st.sidebar:
     st.caption(f"Logged in as: {st.session_state.get('salesperson_name')}")
     if st.button("Logout", use_container_width=True):
-        st.session_state.clear(); st.rerun()
+        st.session_state.clear()
+        st.rerun()
 
-# ---------- Timezone + constants ----------
+# ------------- Timezone + constants -------------
 TZ = st.secrets.get("TIMEZONE", "Asia/Kolkata")
 local_now = datetime.now(ZoneInfo(TZ))
 TODAY = local_now.date()
 TOMORROW = TODAY + timedelta(days=1)
 MAX_DAY = TODAY + timedelta(days=60)
 
-SLOTS = ["— Select slot —","10:00–10:40","10:40–11:20","11:20–12:00",
-         "12:20–13:00","13:00–13:40","13:40–14:20","14:20–15:00","15:00–15:40"]
+SLOTS = [
+    "— Select slot —", "10:00–10:40", "10:40–11:20", "11:20–12:00",
+    "12:20–13:00", "13:00–13:40", "13:40–14:20", "14:20–15:00", "15:00–15:40"
+]
 SUBJECTS = ["— Select subject —","Hindi","Mathematics","GK","SST","Science","English","Pre Primary","EVS","Computer"]
 CURRICULA = ["— Select curriculum —","CBSE","ICSE","State Board","Other"]
 BOOKING_TYPES = ["Live Class","Product Training"]
 
-# ---------- Form ----------
+# ------------- Booking Form -------------
 st.title("📅 Create a Booking")
+
 with st.form("booking_form", clear_on_submit=False):
-    col1, col2 = st.columns(2)
+    col1, col2 = st.columns(2, gap="large")
+
     with col1:
         booking_type = st.selectbox("Booking Type", BOOKING_TYPES, index=0)
         school_name  = st.text_input("School Name")
@@ -74,8 +82,7 @@ with st.form("booking_form", clear_on_submit=False):
         curriculum   = st.selectbox("Curriculum", CURRICULA, index=0)
         subject      = st.selectbox("Subject", SUBJECTS, index=0)
 
-        # Date picker rules:
-        #  - Today is blocked (min = TOMORROW)
+        # Date picker: today blocked; tomorrow..max allowed
         picked_date  = st.date_input(
             "Date",
             value=TOMORROW,
@@ -93,21 +100,16 @@ with st.form("booking_form", clear_on_submit=False):
         st.text_input("Salesperson Number", value=st.session_state["salesperson_number"], disabled=True)
         st.text_input("Salesperson Email", value=st.session_state["salesperson_email"], disabled=True)
 
-        # After you compute local_now, TODAY, TOMORROW and get picked_date …
+        # --- ONLY block tomorrow after 2 PM (do NOT block day-after-tomorrow) ---
+        delta_days = (picked_date - TODAY).days
+        past_cutoff_for_tomorrow = (delta_days == 1) and (local_now.time() >= time(14, 0))
+        if past_cutoff_for_tomorrow:
+            st.warning("📯 It’s past 02:00 PM today. You can’t book for **tomorrow** anymore. Please choose a later date.")
 
-# How many days ahead is the selected date?
-delta_days = (picked_date - TODAY).days
+        # IMPORTANT: submit button is inside the form
+        submit = st.form_submit_button("Book Session", type="primary", disabled=past_cutoff_for_tomorrow)
 
-# Show the warning / disable the button ONLY if it's exactly tomorrow AND after 2pm local
-past_cutoff_for_tomorrow = (delta_days == 1) and (local_now.time() >= time(14, 0))
-
-if past_cutoff_for_tomorrow:
-    st.warning("📯 It’s past 02:00 PM today. You can’t book for tomorrow anymore. Please choose a later date.")
-
-submit = st.form_submit_button("Book Session", type="primary", disabled=past_cutoff_for_tomorrow)
-
-
-# Availability hint (after the form)
+# ------------- Availability hint (outside the form so it updates live) -------------
 if subject != SUBJECTS[0] and slot != SLOTS[0]:
     tlist = candidates_for_subject(subject)
     if tlist:
@@ -118,14 +120,21 @@ if subject != SUBJECTS[0] and slot != SLOTS[0]:
         else:
             st.error("All mapped teachers are unavailable for this slot.")
 
+# Helper
 def invalid(msg: str):
-    st.error(msg); return True
+    st.error(msg)
+    return True
 
+# ------------- Submit handling -------------
 if submit:
-    if not school_name.strip(): invalid("School Name is required.")
-    elif curriculum == CURRICULA[0]: invalid("Please select a curriculum.")
-    elif subject == SUBJECTS[0]: invalid("Please select a subject.")
-    elif slot == SLOTS[0]: invalid("Please select a slot.")
+    if not school_name.strip():
+        invalid("School Name is required.")
+    elif curriculum == CURRICULA[0]:
+        invalid("Please select a curriculum.")
+    elif subject == SUBJECTS[0]:
+        invalid("Please select a subject.")
+    elif slot == SLOTS[0]:
+        invalid("Please select a slot.")
     elif booking_type == "Live Class" and (not grade or not grade.strip()):
         invalid("Grade is required for Live Class.")
     elif exists_booking(school_name.strip(), subject, str(picked_date), slot):
@@ -153,51 +162,42 @@ if submit:
                 "teacher": teacher,
             }
             try:
-                record_booking(data)
-                send_confirmation_emails(data)   # emails queued/sent before rerun
-                st.success(f"✅ Booked! Teacher: {teacher} | {subject} | {data['date']} {slot}")
-                st.rerun()
+                ok, msg, _ = record_booking(data)  # backend re-checks date window too
+                if not ok:
+                    st.error(msg)
+                else:
+                    send_confirmation_emails(data)
+                    st.success(f"✅ Booked! Teacher: {teacher} | {subject} | {data['date']} {slot}")
+                    st.rerun()
             except Exception as e:
                 st.exception(e)
 
+# ------------- My Bookings -------------
 st.divider()
 st.subheader("📋 My Bookings")
+
 rows = get_bookings_for_salesperson(st.session_state["salesperson_email"])
 if not rows:
     st.info("No bookings found.")
 else:
     df = pd.DataFrame(rows)
 
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    TZ = st.secrets.get("TIMEZONE", "Asia/Kolkata")
-
-    def to_local_display(ts) -> str:
-        s = str(ts)
-        try:
-            # Case 1: ISO with 'Z' (UTC) -> convert
-            if s.endswith("Z"):
-                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-            else:
-                # Case 2: ISO maybe with offset
-                dt = datetime.fromisoformat(s)
-                # Case 3: Naive timestamp (no tz) -> assume UTC
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-            return dt.astimezone(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            # Legacy formats: try plain "YYYY-mm-dd HH:MM:SS"
+    # Pretty-print "Booked On" in local timezone if your column is ISO with offset
+    if "Booked On" in df.columns:
+        from datetime import datetime as _dt
+        def _to_local(ts: str) -> str:
+            s = str(ts)
             try:
-                dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("UTC"))
+                # Accept ISO with offset; if naive, assume UTC then convert
+                if s.endswith("Z"):
+                    dt = _dt.fromisoformat(s.replace("Z", "+00:00"))
+                else:
+                    dt = _dt.fromisoformat(s)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
                 return dt.astimezone(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
-                return s  # give up, show raw
-
-    # Find the booked-on column (support various names)
-    for col in df.columns:
-        key = col.strip().lower().replace("_", " ")
-        if key in {"timestamp", "booked on", "booked on"}:
-            df[col] = df[col].apply(to_local_display)
+                return s
+        df["Booked On"] = df["Booked On"].apply(_to_local)
 
     st.dataframe(df, use_container_width=True, hide_index=True)
-
