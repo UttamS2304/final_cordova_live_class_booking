@@ -93,12 +93,19 @@ with st.form("booking_form", clear_on_submit=False):
         st.text_input("Salesperson Number", value=st.session_state["salesperson_number"], disabled=True)
         st.text_input("Salesperson Email", value=st.session_state["salesperson_email"], disabled=True)
 
-        # After-2 PM rule for TOMORROW
-        past_cutoff_for_tomorrow = (picked_date == TOMORROW) and (local_now.time() >= time(14, 0))
-        if past_cutoff_for_tomorrow:
-            st.warning("⏰ It’s past 02:00 PM today. You can’t book for tomorrow anymore. Please choose a later date.")
+        # After you compute local_now, TODAY, TOMORROW and get picked_date …
 
-        submit = st.form_submit_button("Book Session", type="primary", disabled=past_cutoff_for_tomorrow)
+# How many days ahead is the selected date?
+delta_days = (picked_date - TODAY).days
+
+# Show the warning / disable the button ONLY if it's exactly tomorrow AND after 2pm local
+past_cutoff_for_tomorrow = (delta_days == 1) and (local_now.time() >= time(14, 0))
+
+if past_cutoff_for_tomorrow:
+    st.warning("📯 It’s past 02:00 PM today. You can’t book for tomorrow anymore. Please choose a later date.")
+
+submit = st.form_submit_button("Book Session", type="primary", disabled=past_cutoff_for_tomorrow)
+
 
 # Availability hint (after the form)
 if subject != SUBJECTS[0] and slot != SLOTS[0]:
@@ -193,3 +200,4 @@ else:
             df[col] = df[col].apply(to_local_display)
 
     st.dataframe(df, use_container_width=True, hide_index=True)
+
