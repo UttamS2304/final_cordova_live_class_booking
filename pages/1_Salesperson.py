@@ -155,8 +155,39 @@ if submit:
 
 st.divider()
 st.subheader("📋 My Bookings")
+
 rows = get_bookings_for_salesperson(st.session_state["salesperson_email"])
+
 if not rows:
     st.info("No bookings found.")
 else:
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    TZ = st.secrets.get("TIMEZONE", "Asia/Kolkata")
+    from zoneinfo import ZoneInfo
+    import pandas as pd
+    from datetime import datetime
+
+    df = pd.DataFrame(rows)
+
+    # Normalize/pretty Booked On
+    if "timestamp" in df.columns:
+        def _to_local(ts: str) -> str:
+            try:
+                # If ISO with offset -> respect it
+                dt = datetime.fromisoformat(str(ts))
+                if dt.tzinfo is None:
+                    # Legacy rows without tz: assume UTC, then convert
+                    dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+            except Exception:
+                # Legacy plain "YYYY-mm-dd HH:MM:SS"
+                try:
+                    dt = datetime.strptime(str(ts), "%Y-%m-%d %H:%M:%S").replace(tzinfo=ZoneInfo("UTC"))
+                except Exception:
+                    return str(ts)
+            return dt.astimezone(ZoneInfo(TZ)).strftime("%Y-%m-%d %H:%M:%S")
+
+        df["Booked On"] = df["timestamp"].apply(_to_local)
+        # optional: hide raw column
+        df = df.drop(columns=["timestamp"])
+
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
