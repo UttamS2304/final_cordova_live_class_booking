@@ -3,6 +3,9 @@
 from __future__ import annotations
 import sqlite3, re, smtplib, ssl
 from datetime import datetime, date, time, timedelta
+from zoneinfo import ZoneInfo   # Python 3.9+
+import re
+import os
 from typing import Optional, Dict, Any, List, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
@@ -209,29 +212,65 @@ def delete_booking(booking_id: int) -> None:
 # -----------------------------------------------------------------------------
 # Attempt booking API (apply all rules, send mail)
 # -----------------------------------------------------------------------------
-from datetime import datetime, time, timedelta
+# Set your local timezone (or put in st.secrets / .env as TIMEZONE)
+TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata")
+
+def now_local() -> datetime:
+    """Return current time in the configured local timezone."""
+    return datetime.now(ZoneInfo(TIMEZONE))
+
+def parse_session_date(d) -> date:
+    """Robustly parse the session date coming from the form."""
+    if isinstance(d, date):
+        return d
+    s = str(d).strip()
+    # Try ISO with time first, then plain date
+    try:
+        return datetime.fromisoformat(s).date()
+    except Exception:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+
+def parse_slot_range(slot_str: str) -> tuple[time, time] | tuple[None, None]:
+    """Parse 'HH:MM–HH:MM' or 'HH:MM - HH:MM' into time objects."""
+    if not slot_str:
+        return None, None
+    s = str(slot_str).strip()
+    # normalize hyphen/en-dash
+    parts = re.split(r"\s*[–-]\s*", s)
+    if len(parts) != 2:
+        return None, None
+    try:
+        t1 = datetime.strptime(parts[0], "%H:%M").time()
+        t2 = datetime.strptime(parts[1], "%H:%M").time()
+        return t1, t2
+    except Exception:
+        return None, None
+#------------------------------------------------------------------
 
 def attempt_booking(form_data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]]:
     """
     Applies constraints, picks teacher, records booking, sends emails.
     Caller should display the returned message to the user.
     """
-    # Extract booking date
-    booking_date = datetime.strptime(form_data["date"], "%Y-%m-%d").date()
-    today = datetime.now().date()
-    now_time = datetime.now().time()
+    # ---------- HARD RULES (date/time) ----------
+    local_now   = now_local()
+    today_local = local_now.date()
+    session_date = parse_session_date(form_data["date"])
+    slot_start, slot_end = parse_slot_range(form_data.get("slot", ""))
 
-    # Restriction 1: No same-day bookings
-    if booking_date == today:
-        return False, "❌ Bookings must be made at least one day in advance.", None
+    # Rule A: must be at least 1 day in advance (no today or past)
+    if session_date <= today_local:
+        return False, "❌ Sessions must be booked at least one day in advance.", None
 
-    # Restriction 2: Must be booked before 2:00 PM on the previous day
-    if booking_date == today + timedelta(days=1) and now_time >= time(14, 0):
-        return False, "❌ You can only book sessions for tomorrow before 2:00 PM today.", None
+    # Rule B: booking for 'tomorrow' allowed only before 2:00 PM local time
+    if session_date == today_local + timedelta(days=1) and local_now.time() >= time(14, 0):
+        return False, "❌ You can only book for tomorrow before 02:00 PM.", None
 
-    # -----------------------------
-    # Existing logic continues here
-    # -----------------------------
+    # Rule C (safety): if someone ever tries same-day slot, block past times
+    if session_date == today_local and slot_end and local_now.time() >= slot_end:
+        return False, "❌ This slot time has already passed.", None
+    # -------------------------------------------
+
     day  = form_data["date"]
     slot = form_data["slot"]
     subj = form_data["subject"]
@@ -259,10 +298,10 @@ def attempt_booking(form_data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]
     if not ok:
         return False, msg, None
 
-    # Emails (confirmation)
+    # Emails (confirmation) — non-blocking
     try:
         send_confirmation_emails({
-            "Salesperson Email": row["salesperson_email"],
+            "Salesperson Email": row.get("salesperson_email") or row.get("email"),
             "Salesperson": row["salesperson_name"],
             "School": row["school_name"],
             "Grade": row.get("grade"),
@@ -277,6 +316,7 @@ def attempt_booking(form_data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]
         _elog(f"post-booking email error: {e}")
 
     return True, f"Booked with {teacher}.", booking_id
+    
 # -----------------------------------------------------------------------------
 # Email system (UTF-8 safe, logging, resend)
 # -----------------------------------------------------------------------------
@@ -494,5 +534,6 @@ def delete_unavailability(unavail_id: int) -> None:
     _ensure_unavailability_table()
     _exec("DELETE FROM teacher_unavailability WHERE id=?", (unavail_id,))
     get_conn().commit()
+
 
 
