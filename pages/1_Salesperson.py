@@ -1,8 +1,6 @@
 import streamlit as st
-
-
-import streamlit as st
-from datetime import date, timedelta
+from datetime import datetime, date, time, timedelta
+from zoneinfo import ZoneInfo  # Python 3.9+
 import pandas as pd
 
 from backend import (
@@ -52,8 +50,11 @@ with st.sidebar:
     if st.button("Logout", use_container_width=True):
         st.session_state.clear(); st.rerun()
 
-# ---------- Constants ----------
-TODAY = date.today()
+# ---------- Timezone + constants ----------
+TZ = st.secrets.get("TIMEZONE", "Asia/Kolkata")
+local_now = datetime.now(ZoneInfo(TZ))
+TODAY = local_now.date()
+TOMORROW = TODAY + timedelta(days=1)
 MAX_DAY = TODAY + timedelta(days=60)
 
 SLOTS = ["— Select slot —","10:00–10:40","10:40–11:20","11:20–12:00",
@@ -72,17 +73,34 @@ with st.form("booking_form", clear_on_submit=False):
         title_used   = st.text_input("Title Used by School")
         curriculum   = st.selectbox("Curriculum", CURRICULA, index=0)
         subject      = st.selectbox("Subject", SUBJECTS, index=0)
-        picked_date  = st.date_input("Date", value=TODAY, min_value=TODAY, max_value=MAX_DAY, format="YYYY-MM-DD")
+
+        # Date picker rules:
+        #  - Today is blocked (min = TOMORROW)
+        picked_date  = st.date_input(
+            "Date",
+            value=TOMORROW,
+            min_value=TOMORROW,
+            max_value=MAX_DAY,
+            format="YYYY-MM-DD",
+            help="Bookings must be made at least one day in advance."
+        )
         slot         = st.selectbox("Slot", SLOTS, index=0)
+
     with col2:
         grade = st.text_input("Grade (Live Class only)") if booking_type == "Live Class" else None
         topic = st.text_input("Topic (optional)")
         st.text_input("Salesperson Name", value=st.session_state["salesperson_name"], disabled=True)
         st.text_input("Salesperson Number", value=st.session_state["salesperson_number"], disabled=True)
         st.text_input("Salesperson Email", value=st.session_state["salesperson_email"], disabled=True)
-    submit = st.form_submit_button("Book Session", type="primary")
 
-# Availability hint
+        # After-2 PM rule for TOMORROW
+        past_cutoff_for_tomorrow = (picked_date == TOMORROW) and (local_now.time() >= time(14, 0))
+        if past_cutoff_for_tomorrow:
+            st.warning("⏰ It’s past 02:00 PM today. You can’t book for tomorrow anymore. Please choose a later date.")
+
+        submit = st.form_submit_button("Book Session", type="primary", disabled=past_cutoff_for_tomorrow)
+
+# Availability hint (after the form)
 if subject != SUBJECTS[0] and slot != SLOTS[0]:
     tlist = candidates_for_subject(subject)
     if tlist:
@@ -93,7 +111,8 @@ if subject != SUBJECTS[0] and slot != SLOTS[0]:
         else:
             st.error("All mapped teachers are unavailable for this slot.")
 
-def invalid(msg: str): st.error(msg); return True
+def invalid(msg: str):
+    st.error(msg); return True
 
 if submit:
     if not school_name.strip(): invalid("School Name is required.")
@@ -118,7 +137,7 @@ if submit:
                 "grade": grade.strip() if (booking_type == "Live Class" and grade) else None,
                 "curriculum": curriculum,
                 "subject": subject,
-                "date": str(picked_date),
+                "date": picked_date.strftime("%Y-%m-%d"),  # ensure string for backend
                 "slot": slot,
                 "topic": (topic or "").strip(),
                 "salesperson_name": st.session_state["salesperson_name"],
@@ -128,7 +147,7 @@ if submit:
             }
             try:
                 record_booking(data)
-                send_confirmation_emails(data)   # <-- emails queued/sent before rerun
+                send_confirmation_emails(data)   # emails queued/sent before rerun
                 st.success(f"✅ Booked! Teacher: {teacher} | {subject} | {data['date']} {slot}")
                 st.rerun()
             except Exception as e:
@@ -141,6 +160,3 @@ if not rows:
     st.info("No bookings found.")
 else:
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-
-
