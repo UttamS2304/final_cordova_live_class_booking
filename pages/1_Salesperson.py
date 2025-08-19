@@ -75,10 +75,44 @@ CURRICULA = ["— Select curriculum —","CBSE","ICSE","State Board","Other"]
 BOOKING_TYPES = ["Live Class","Product Training"]
 
 # ---------------------------------------------------------------------
-# Booking form
+# Date selection OUTSIDE the form (so disabled state updates live)
 # ---------------------------------------------------------------------
 st.title("📅 Create a Booking")
 
+date_col, rule_col = st.columns([1, 2], gap="large")
+with date_col:
+    picked_date = st.date_input(
+        "Date",
+        value=st.session_state.get("picked_date", TOMORROW),
+        min_value=TOMORROW,            # block today
+        max_value=MAX_DAY,
+        format="YYYY-MM-DD",
+        help="Bookings must be made at least one day in advance.",
+        key="picked_date"              # persist across reruns
+    )
+
+with rule_col:
+    IST_now = datetime.now(ZoneInfo(TZ))
+    today = IST_now.date()
+    tomorrow = today + timedelta(days=1)
+
+    # picked_date is a datetime.date already
+    delta_days = (picked_date - today).days
+    after_two_pm = IST_now.time() >= time(14, 0)
+
+    # Disable rule: only if "tomorrow" AND time >= 14:00 IST
+    disable_submit = (delta_days == 1) and after_two_pm
+
+    # User hint
+    if picked_date == tomorrow:
+        if after_two_pm:
+            st.warning("📯 It’s past **02:00 PM IST** today. You can’t book for **tomorrow** anymore. Please choose a later date.")
+        else:
+            st.caption("✅ **Tomorrow** selected — allowed until **2:00 PM IST**.")
+
+# ---------------------------------------------------------------------
+# Booking form (everything else stays inside the form)
+# ---------------------------------------------------------------------
 with st.form("booking_form", clear_on_submit=False):
     col1, col2 = st.columns(2, gap="large")
 
@@ -88,16 +122,10 @@ with st.form("booking_form", clear_on_submit=False):
         title_used   = st.text_input("Title Used by School")
         curriculum   = st.selectbox("Curriculum", CURRICULA, index=0)
         subject      = st.selectbox("Subject", SUBJECTS, index=0)
+        slot         = st.selectbox("Slot", SLOTS, index=0)
 
-        picked_date  = st.date_input(
-            "Date",
-            value=TOMORROW,
-            min_value=TOMORROW,           # block today
-            max_value=MAX_DAY,
-            format="YYYY-MM-DD",
-            help="Bookings must be made at least one day in advance."
-        )
-        slot = st.selectbox("Slot", SLOTS, index=0)
+        # Show the chosen date (read-only) to avoid duplicate pickers
+        st.text_input("Selected Date", value=picked_date.strftime("%Y-%m-%d"), disabled=True)
 
     with col2:
         grade = st.text_input("Grade (Live Class only)") if booking_type == "Live Class" else None
@@ -106,19 +134,7 @@ with st.form("booking_form", clear_on_submit=False):
         st.text_input("Salesperson Number", value=st.session_state["salesperson_number"], disabled=True)
         st.text_input("Salesperson Email", value=st.session_state["salesperson_email"], disabled=True)
 
-        # ---- ONLY block booking for *tomorrow* after 2 PM local time ----
-        local_now = datetime.now(ZoneInfo(TZ))
-        today = local_now.date()
-
-        # make sure we compare date objects
-        picked_day = picked_date.date() if hasattr(picked_date, "date") else picked_date
-        delta_days = (picked_day - today).days
-        disable_submit = (delta_days == 1) and (local_now.time() >= time(14, 0))
-
-        if disable_submit:
-            st.warning("📯 It’s past 02:00 PM today. You can’t book for **tomorrow** anymore. Please choose a later date.")
-
-        # submit button INSIDE the form (fixes 'missing submit' warning)
+        # Submit button uses the disable flag computed outside
         submit = st.form_submit_button("Book Session", type="primary", disabled=disable_submit)
 
 # ---------------------------------------------------------------------
@@ -177,7 +193,7 @@ if submit:
                 "teacher": teacher,
             }
             try:
-                ok, msg, _ = record_booking(data)  # backend enforces tomorrow-after-2PM rule too
+                ok, msg, _ = record_booking(data)  # backend still enforces the rule too
                 if not ok:
                     st.error(msg)
                 else:
