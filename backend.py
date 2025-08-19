@@ -1,35 +1,64 @@
-# backend.py — FINAL (friendly messages + caps + robust email)
+# backend.py — FINAL (timezone-safe, enforced rules, friendly messages)
 
 from __future__ import annotations
-import sqlite3, re, smtplib, ssl
-from datetime import datetime, date, time, timedelta
-from zoneinfo import ZoneInfo   # Python 3.9+
-import re
+
 import os
+import re
+import ssl
+import smtplib
+import sqlite3
 from typing import Optional, Dict, Any, List, Tuple
-from concurrent.futures import ThreadPoolExecutor
 from email.message import EmailMessage
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, date, time, timedelta
+from zoneinfo import ZoneInfo  # Python 3.9+
 
 import streamlit as st
+
 from init_db import initialize_database
 from teacher_mapping import candidates_for_subject
-from datetime import datetime, date, time, timedelta
-from zoneinfo import ZoneInfo
-import os
 
-# Read from secrets/env or default to IST
-TZ = os.getenv("TIMEZONE") or "Asia/Kolkata"
+# -----------------------------------------------------------------------------
+# Timezone config & helpers
+# -----------------------------------------------------------------------------
+TZ = os.getenv("TIMEZONE") or st.secrets.get("TIMEZONE", "Asia/Kolkata")
 try:
     TZINFO = ZoneInfo(TZ)
 except Exception:
     TZINFO = ZoneInfo("Asia/Kolkata")
 
 def now_local() -> datetime:
+    """Current time in configured local timezone."""
     return datetime.now(TZINFO)
+
+def parse_session_date(d) -> date:
+    """Robustly parse session date."""
+    if isinstance(d, date):
+        return d
+    s = str(d).strip()
+    # Try ISO with time first, then plain date
+    try:
+        return datetime.fromisoformat(s).date()
+    except Exception:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+
+def parse_slot_range(slot_str: str) -> tuple[Optional[time], Optional[time]]:
+    """Parse 'HH:MM–HH:MM' (en-dash) or 'HH:MM-HH:MM' (hyphen)."""
+    if not slot_str:
+        return None, None
+    parts = re.split(r"\s*[–-]\s*", str(slot_str).strip())
+    if len(parts) != 2:
+        return None, None
+    try:
+        t1 = datetime.strptime(parts[0], "%H:%M").time()
+        t2 = datetime.strptime(parts[1], "%H:%M").time()
+        return t1, t2
+    except Exception:
+        return None, None
 
 
 # -----------------------------------------------------------------------------
-# DB bootstrap
+# DB bootstrap & connection helpers
 # -----------------------------------------------------------------------------
 initialize_database()
 DB_PATH = "cordova_publication.db"
@@ -53,9 +82,6 @@ def _ensure_email_log_table() -> None:
 
 _ensure_email_log_table()
 
-# -----------------------------------------------------------------------------
-# Connection helpers
-# -----------------------------------------------------------------------------
 @st.cache_resource
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -68,8 +94,9 @@ def _exec(q: str, args: tuple = ()) -> sqlite3.Cursor:
     cur.execute(q, args)
     return cur
 
+
 # -----------------------------------------------------------------------------
-# Capacity configuration (overridable via secrets)
+# Capacity configuration
 # -----------------------------------------------------------------------------
 DEFAULT_MAX_PER_TEACHER = int(st.secrets.get("MAX_CLASSES_PER_TEACHER_PER_DAY", 2))
 MAX_PARALLEL_CLASSES_PER_SLOT = int(st.secrets.get("MAX_PARALLEL_CLASSES_PER_SLOT", 3))
@@ -84,7 +111,6 @@ def _per_teacher_limits() -> dict:
       [PER_TEACHER_LIMITS]
       MEGHA = "1"
       VIVEK_SIR = "2"
-    Hard default below ensures Megha = 1/day even if secrets omitted.
     """
     raw = st.secrets.get("PER_TEACHER_LIMITS", {})
     limits: dict[str, int] = {}
@@ -93,21 +119,22 @@ def _per_teacher_limits() -> dict:
             limits[_norm_key(k)] = int(v)
         except Exception:
             pass
-    limits.setdefault("MEGHA", 1)  # Hard rule: Megha = 1/day
+    limits.setdefault("MEGHA", 1)  # Hard rule: Megha = 1/day unless overridden
     return limits
 
 @st.cache_data(show_spinner=False, ttl=60)
 def daily_limit_for_teacher(teacher: str) -> int:
     return _per_teacher_limits().get(_norm_key(teacher), DEFAULT_MAX_PER_TEACHER)
 
+
 # -----------------------------------------------------------------------------
 # Availability & guards
 # -----------------------------------------------------------------------------
-def is_teacher_unavailable(teacher: str, date: str, slot: str) -> bool:
+def is_teacher_unavailable(teacher: str, day: str, slot: str) -> bool:
     cur = _exec(
         """SELECT COUNT(*) FROM teacher_unavailability
            WHERE teacher=? AND date=? AND (slot IS NULL OR slot=?)""",
-        (teacher, date, slot),
+        (teacher, day, slot),
     )
     return cur.fetchone()[0] > 0
 
@@ -129,36 +156,61 @@ def count_parallel_on_slot(day: str, slot: str) -> int:
     cur = _exec("SELECT COUNT(*) FROM bookings WHERE date=? AND slot=?", (day, slot))
     return int(cur.fetchone()[0])
 
+
 # -----------------------------------------------------------------------------
 # Teacher choice (availability + caps)
 # -----------------------------------------------------------------------------
-def pick_teacher(subject: str, date: str, slot: str) -> Optional[str]:
-    """
-    Pick first candidate who:
-      - not unavailable,
-      - not already booked in slot,
-      - under per-teacher daily limit for that date.
-    """
+def pick_teacher(subject: str, day: str, slot: str) -> Optional[str]:
+    """First candidate who is available, not busy, and under daily limit."""
     for t in candidates_for_subject(subject):
-        if is_teacher_unavailable(t, date, slot):
+        if is_teacher_unavailable(t, day, slot):
             continue
-        if teacher_busy(t, date, slot):
+        if teacher_busy(t, day, slot):
             continue
-        if count_teacher_on_day(t, date) >= daily_limit_for_teacher(t):
+        if count_teacher_on_day(t, day) >= daily_limit_for_teacher(t):
             continue
         return t
     return None
 
+
 # -----------------------------------------------------------------------------
-# Bookings CRUD (friendly messages, no tracebacks)
+# Bookings CRUD (rules enforced here)
 # -----------------------------------------------------------------------------
+def _enforce_booking_window(day_str: str, slot_str: str) -> Tuple[bool, str]:
+    """
+    Enforce:
+      - No same-day (or past) bookings
+      - Booking for 'tomorrow' only before 14:00 local time
+    """
+    local_now = now_local()
+    today = local_now.date()
+    session_date = parse_session_date(day_str)
+
+    # Rule A: must be at least 1 day in advance
+    if session_date <= today:
+        return False, "❌ Sessions must be booked at least one day in advance."
+
+    # Rule B: if booking is for tomorrow, must be before 2 PM today
+    if session_date == today + timedelta(days=1) and local_now.time() >= time(14, 0):
+        return False, "❌ You can only book for tomorrow before 02:00 PM."
+
+    return True, ""
+
 def record_booking(data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]]:
     """
-    Insert booking after guard checks.
+    Insert booking after guard checks (including booking window rules).
     Returns (ok, message, booking_id|None). Never raises for user errors.
     """
-    day = data["date"]; slot = data["slot"]; subj = data["subject"]
-    school = data["school_name"]; teacher = data["teacher"]
+    day   = data["date"]
+    slot  = data["slot"]
+    subj  = data["subject"]
+    school = data["school_name"]
+    teacher = data["teacher"]
+
+    # Booking window rules (enforced even if UI calls record_booking directly)
+    ok, msg = _enforce_booking_window(day, slot)
+    if not ok:
+        return False, msg, None
 
     # Parallel cap
     if count_parallel_on_slot(day, slot) >= MAX_PARALLEL_CLASSES_PER_SLOT:
@@ -174,6 +226,9 @@ def record_booking(data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]]:
     if count_teacher_on_day(teacher, day) >= daily_limit_for_teacher(teacher):
         return False, f"{teacher} has reached the daily limit ({daily_limit_for_teacher(teacher)}).", None
 
+    # Store timezone-aware timestamp (ISO with offset)
+    booked_ts = now_local().isoformat(timespec="seconds")
+
     cur = _exec(
         """INSERT INTO bookings (
             booking_type, school_name, title_used, grade, curriculum, subject,
@@ -185,8 +240,7 @@ def record_booking(data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]]:
             data.get("grade"), data.get("curriculum"), data["subject"],
             day, slot, data.get("topic"),
             data["salesperson_name"], data["salesperson_number"],
-            data["salesperson_email"], teacher,
-            datetime.now().isoformat(timespec="seconds"),
+            data["salesperson_email"], teacher, booked_ts,
         ),
     )
     get_conn().commit()
@@ -218,101 +272,60 @@ def get_all_bookings() -> List[Dict[str, Any]]:
             "Salesperson Email","Booked On"]
     return [dict(zip(cols, r)) for r in cur.fetchall()]
 
-def delete_booking(booking_id: int) -> None:
-    _exec("DELETE FROM bookings WHERE id=?", (booking_id,))
+def delete_booking(booking_id_or_row) -> None:
+    """
+    Delete by id (preferred). If a dict is passed (older admin UI), try using its id,
+    otherwise fall back to a strict key match.
+    """
+    if isinstance(booking_id_or_row, int):
+        _exec("DELETE FROM bookings WHERE id=?", (booking_id_or_row,))
+    elif isinstance(booking_id_or_row, dict) and "id" in booking_id_or_row:
+        _exec("DELETE FROM bookings WHERE id=?", (booking_id_or_row["id"],))
+    else:
+        row = booking_id_or_row
+        _exec("""DELETE FROM bookings
+                 WHERE school_name=? AND subject=? AND date=? AND slot=? 
+                       AND salesperson_name=? AND teacher=?""",
+              (row["school_name"], row["subject"], row["date"], row["slot"],
+               row["salesperson_name"], row["teacher"]))
     get_conn().commit()
     get_all_bookings.clear(); get_bookings_for_salesperson.clear()
 
+
 # -----------------------------------------------------------------------------
-# Attempt booking API (apply all rules, send mail)
+# Attempt booking API (also enforces rules; used by newer UI)
 # -----------------------------------------------------------------------------
-# Set your local timezone (or put in st.secrets / .env as TIMEZONE)
-TIMEZONE = os.getenv("TIMEZONE", "Asia/Kolkata")
-
-def now_local() -> datetime:
-    """Return current time in the configured local timezone."""
-    return datetime.now(ZoneInfo(TIMEZONE))
-
-def parse_session_date(d) -> date:
-    """Robustly parse the session date coming from the form."""
-    if isinstance(d, date):
-        return d
-    s = str(d).strip()
-    # Try ISO with time first, then plain date
-    try:
-        return datetime.fromisoformat(s).date()
-    except Exception:
-        return datetime.strptime(s, "%Y-%m-%d").date()
-
-def parse_slot_range(slot_str: str) -> tuple[time, time] | tuple[None, None]:
-    """Parse 'HH:MM–HH:MM' or 'HH:MM - HH:MM' into time objects."""
-    if not slot_str:
-        return None, None
-    s = str(slot_str).strip()
-    # normalize hyphen/en-dash
-    parts = re.split(r"\s*[–-]\s*", s)
-    if len(parts) != 2:
-        return None, None
-    try:
-        t1 = datetime.strptime(parts[0], "%H:%M").time()
-        t2 = datetime.strptime(parts[1], "%H:%M").time()
-        return t1, t2
-    except Exception:
-        return None, None
-#------------------------------------------------------------------
-
 def attempt_booking(form_data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]]:
     """
     Applies constraints, picks teacher, records booking, sends emails.
-    Caller should display the returned message to the user.
     """
-    # ---------- HARD RULES (date/time) ----------
-    local_now   = now_local()
-    today_local = local_now.date()
-    session_date = parse_session_date(form_data["date"])
-    slot_start, slot_end = parse_slot_range(form_data.get("slot", ""))
-
-    # Rule A: must be at least 1 day in advance (no today or past)
-    if session_date <= today_local:
-        return False, "❌ Sessions must be booked at least one day in advance.", None
-
-    # Rule B: booking for 'tomorrow' allowed only before 2:00 PM local time
-    if session_date == today_local + timedelta(days=1) and local_now.time() >= time(14, 0):
-        return False, "❌ You can only book for tomorrow before 02:00 PM.", None
-
-    # Rule C (safety): if someone ever tries same-day slot, block past times
-    if session_date == today_local and slot_end and local_now.time() >= slot_end:
-        return False, "❌ This slot time has already passed.", None
-    # -------------------------------------------
-
     day  = form_data["date"]
     slot = form_data["slot"]
     subj = form_data["subject"]
 
-    # Parallel capacity
+    # Booking window
+    ok, msg = _enforce_booking_window(day, slot)
+    if not ok:
+        return False, msg, None
+
+    # Capacity & duplicate checks
     if count_parallel_on_slot(day, slot) >= MAX_PARALLEL_CLASSES_PER_SLOT:
         return False, "This slot is full. Please choose another time.", None
-
-    # Duplicate guard
     if exists_booking(form_data["school_name"], subj, day, slot):
         return False, "This school & subject is already booked for that date & slot.", None
 
-    # Teacher selection
+    # Teacher selection & per-day cap
     teacher = pick_teacher(subj, day, slot)
     if not teacher:
         return False, "No suitable teacher available (busy/unavailable/daily cap reached).", None
-
-    # Final per-teacher cap (belt & suspenders)
     if count_teacher_on_day(teacher, day) >= daily_limit_for_teacher(teacher):
         return False, f"{teacher} has reached the daily limit ({daily_limit_for_teacher(teacher)}).", None
 
     row = dict(form_data); row["teacher"] = teacher
-
     ok, msg, booking_id = record_booking(row)
     if not ok:
         return False, msg, None
 
-    # Emails (confirmation) — non-blocking
     try:
         send_confirmation_emails({
             "Salesperson Email": row.get("salesperson_email") or row.get("email"),
@@ -330,22 +343,21 @@ def attempt_booking(form_data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]
         _elog(f"post-booking email error: {e}")
 
     return True, f"Booked with {teacher}.", booking_id
-    
+
+
 # -----------------------------------------------------------------------------
 # Email system (UTF-8 safe, logging, resend)
 # -----------------------------------------------------------------------------
 def _elog(msg: str): print(f"[EMAIL] {msg}")
 
 def get_teacher_email(teacher: str) -> str:
-    """
-    Look up teacher email from [TEACHER_EMAILS] using a normalized key.
-    Includes fallbacks and logs the key used.
-    """
+    """Look up teacher email from [TEACHER_EMAILS] using a normalized key."""
     book = st.secrets.get("TEACHER_EMAILS", {})
     if not teacher:
         _elog("teacher email lookup skipped: empty teacher"); return ""
     key_norm = _norm_key(teacher)
     val = book.get(key_norm)
+
     if not val:
         alt_keys = {
             key_norm.replace("MAAM", "MAM"),
@@ -367,7 +379,7 @@ def get_teacher_email(teacher: str) -> str:
 def _log_email(to_addr: str, subject: str, status: str, error: str | None = None):
     try:
         _exec("INSERT INTO email_events (ts, to_addr, subject, status, error) VALUES (?, ?, ?, ?, ?)",
-              (datetime.now().isoformat(timespec="seconds"), to_addr, subject, status, error))
+              (now_local().isoformat(timespec="seconds"), to_addr, subject, status, error))
         get_conn().commit()
     except Exception as e:
         print(f"[EMAIL][LOG-FAIL] {e}")
@@ -426,10 +438,8 @@ def _email_sync_mode() -> bool:
 
 def _send_async(to_addr: str, subject: str, body: str):
     if _email_sync_mode():
-        _elog("SYNC MODE — sending immediately")
         _smtp_send(to_addr, subject, body)
     else:
-        _elog("queueing (async)")
         get_mail_executor().submit(_smtp_send, to_addr, subject, body)
 
 def send_confirmation_emails(booking: Dict[str, Any]) -> None:
@@ -468,7 +478,7 @@ def send_confirmation_emails(booking: Dict[str, Any]) -> None:
             f"Salesperson: {sp_name}\nSalesperson Email: {sp_email}\n")
 
 def send_cancellation_emails(booking: Dict[str, Any]) -> None:
-    """Send cancellation emails synchronously (inline) to avoid losing them on rerun."""
+    """Send cancellation emails synchronously to avoid losing them on rerun."""
     def g(CAPS: str, form: str) -> Any:
         return booking.get(CAPS) if CAPS in booking else booking.get(form)
 
@@ -497,6 +507,7 @@ def send_cancellation_emails(booking: Dict[str, Any]) -> None:
             f"Subject: {subj}\nDate: {day}\nSlot: {slot}\nSchool: {school}\nGrade: {grade}\n"
         )
 
+
 # -----------------------------------------------------------------------------
 # Email log APIs (Admin → Email tab)
 # -----------------------------------------------------------------------------
@@ -517,8 +528,9 @@ def resend_email(event_id: int):
     to_addr, subject = row
     _smtp_send(to_addr, subject, f"[RESEND] This is a resend attempt for '{subject}'.")
 
+
 # -----------------------------------------------------------------------------
-# Teacher Unavailability (shared DB + ensure table)
+# Teacher Unavailability (and admin API compatibility)
 # -----------------------------------------------------------------------------
 def _ensure_unavailability_table() -> None:
     _exec("""
@@ -532,10 +544,10 @@ def _ensure_unavailability_table() -> None:
     _exec("CREATE INDEX IF NOT EXISTS idx_unavail_teacher_date ON teacher_unavailability(teacher, date)")
     get_conn().commit()
 
-def mark_unavailable(teacher: str, date: str, slot: Optional[str]) -> None:
+def mark_unavailable(teacher: str, day: str, slot: Optional[str]) -> None:
     _ensure_unavailability_table()
     _exec("INSERT INTO teacher_unavailability (teacher, date, slot) VALUES (?, ?, ?)",
-          (teacher, date, slot))
+          (teacher, day, slot))
     get_conn().commit()
 
 def list_unavailability() -> List[Dict[str, Any]]:
@@ -549,6 +561,26 @@ def delete_unavailability(unavail_id: int) -> None:
     _exec("DELETE FROM teacher_unavailability WHERE id=?", (unavail_id,))
     get_conn().commit()
 
+# Backward-compatible names used by your admin UI
+def mark_teacher_unavailable(teacher: str, day: str, slot: Optional[str]):
+    return mark_unavailable(teacher, day, slot)
 
+def get_teacher_unavailability():
+    return list_unavailability()
 
-
+def delete_teacher_unavailability(teacher_or_id, day=None, slot=None):
+    """
+    Accept either an id (preferred) or (teacher, date, slot) triple
+    for old admin dashboards.
+    """
+    if isinstance(teacher_or_id, int):
+        return delete_unavailability(teacher_or_id)
+    if teacher_or_id and day:
+        _ensure_unavailability_table()
+        if slot:
+            _exec("DELETE FROM teacher_unavailability WHERE teacher=? AND date=? AND slot=?",
+                  (teacher_or_id, day, slot))
+        else:
+            _exec("DELETE FROM teacher_unavailability WHERE teacher=? AND date=? AND slot IS NULL",
+                  (teacher_or_id, day))
+        get_conn().commit()
