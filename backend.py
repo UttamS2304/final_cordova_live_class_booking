@@ -13,6 +13,20 @@ from email.message import EmailMessage
 import streamlit as st
 from init_db import initialize_database
 from teacher_mapping import candidates_for_subject
+from datetime import datetime, date, time, timedelta
+from zoneinfo import ZoneInfo
+import os
+
+# Read from secrets/env or default to IST
+TZ = os.getenv("TIMEZONE") or "Asia/Kolkata"
+try:
+    TZINFO = ZoneInfo(TZ)
+except Exception:
+    TZINFO = ZoneInfo("Asia/Kolkata")
+
+def now_local() -> datetime:
+    return datetime.now(TZINFO)
+
 
 # -----------------------------------------------------------------------------
 # DB bootstrap
@@ -534,6 +548,7 @@ def delete_unavailability(unavail_id: int) -> None:
     _ensure_unavailability_table()
     _exec("DELETE FROM teacher_unavailability WHERE id=?", (unavail_id,))
     get_conn().commit()
+
 
 
 
