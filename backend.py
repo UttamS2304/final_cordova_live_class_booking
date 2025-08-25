@@ -59,21 +59,31 @@ def parse_slot_range(slot_str: str) -> tuple[Optional[time], Optional[time]]:
 # -----------------------------------------------------------------------------
 # Postgres (Supabase) connection & schema
 # -----------------------------------------------------------------------------
-def _db_url() -> str:
-    url = os.getenv("SUPABASE_DB_URL") or st.secrets.get("SUPABASE_DB_URL", "")
-    if not url:
-        raise RuntimeError(
-            "SUPABASE_DB_URL not set. Add it to your .env or Streamlit secrets."
-        )
-    return url
+def _db_url() -> str | None:
+    """
+    Return a Postgres connection string if available, otherwise None.
+    Looks in Streamlit secrets and environment variables under several keys.
+    """
+    for key in ("SUPABASE_DB_URL", "SUPABASE_CONNECTION_STRING", "DATABASE_URL"):
+        val = (st.secrets.get(key) if hasattr(st, "secrets") else None) or os.getenv(key)
+        if val and str(val).strip():
+            return str(val).strip()
+    return None
 
 @st.cache_resource
 def get_conn():
-    """Shared Postgres connection (autocommit)."""
-    conn = psycopg2.connect(_db_url())
-    conn.autocommit = True
-    _ensure_schema(conn)
-    return conn
+    url = _db_url()
+    if url:
+        import psycopg2
+        return psycopg2.connect(url)
+    else:
+        # Safe fallback to SQLite for local runs without secrets
+        import sqlite3
+        conn = sqlite3.connect("cordova_publication.db", check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        return conn
+        
 
 def _ensure_schema(conn) -> None:
     """Create required tables/indexes if missing."""
@@ -620,3 +630,4 @@ def delete_teacher_unavailability(teacher_or_id, day=None, slot=None):
         else:
             _exec("DELETE FROM teacher_unavailability WHERE teacher=%s AND date=%s AND slot IS NULL",
                   (teacher_or_id, day))
+
