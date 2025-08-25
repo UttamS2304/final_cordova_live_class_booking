@@ -1,22 +1,15 @@
-# backend.py — FINAL (Supabase Postgres, timezone-safe, enforced rules, friendly messages)
+# backend.py — FINAL (Supabase Postgres + SQLite fallback, timezone-safe, enforced rules)
 
 from __future__ import annotations
 
-import os
-import re
-import ssl
-import smtplib
+import os, re, ssl, smtplib
 from typing import Optional, Dict, Any, List, Tuple
 from email.message import EmailMessage
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, date, time, timedelta
-from zoneinfo import ZoneInfo  # Python 3.9+
+from zoneinfo import ZoneInfo
 
 import streamlit as st
-import psycopg2
-from psycopg2.extras import RealDictCursor
-
-from teacher_mapping import candidates_for_subject
 
 # -----------------------------------------------------------------------------
 # Timezone config & helpers
@@ -28,11 +21,9 @@ except Exception:
     TZINFO = ZoneInfo("Asia/Kolkata")
 
 def now_local() -> datetime:
-    """Current time in configured local timezone."""
     return datetime.now(TZINFO)
 
 def parse_session_date(d) -> date:
-    """Robustly parse session date."""
     if isinstance(d, date):
         return d
     s = str(d).strip()
@@ -42,7 +33,6 @@ def parse_session_date(d) -> date:
         return datetime.strptime(s, "%Y-%m-%d").date()
 
 def parse_slot_range(slot_str: str) -> tuple[Optional[time], Optional[time]]:
-    """Parse 'HH:MM–HH:MM' (en-dash) or 'HH:MM-HH:MM' (hyphen)."""
     if not slot_str:
         return None, None
     parts = re.split(r"\s*[–-]\s*", str(slot_str).strip())
@@ -57,37 +47,83 @@ def parse_slot_range(slot_str: str) -> tuple[Optional[time], Optional[time]]:
 
 
 # -----------------------------------------------------------------------------
-# Postgres (Supabase) connection & schema
+# DB connection (Postgres via SUPABASE_*; fallback to SQLite for local)
 # -----------------------------------------------------------------------------
 def _db_url() -> str | None:
-    """
-    Return a Postgres connection string if available, otherwise None.
-    Looks in Streamlit secrets and environment variables under several keys.
-    """
     for key in ("SUPABASE_DB_URL", "SUPABASE_CONNECTION_STRING", "DATABASE_URL"):
         val = (st.secrets.get(key) if hasattr(st, "secrets") else None) or os.getenv(key)
         if val and str(val).strip():
             return str(val).strip()
     return None
 
+def _is_postgres_conn(conn) -> bool:
+    return conn.__class__.__module__.startswith("psycopg2")
+
+def _is_dml(sql: str) -> bool:
+    head = sql.strip().split()[0].upper() if sql else ""
+    return head in {"INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER"}
+
+def _adapt_sql(sql: str, conn) -> str:
+    # Use %s for Postgres, ? for SQLite
+    if _is_postgres_conn(conn):
+        return sql
+    return sql.replace("%s", "?")
+
 @st.cache_resource
 def get_conn():
     url = _db_url()
     if url:
         import psycopg2
-        return psycopg2.connect(url)
+        conn = psycopg2.connect(url, sslmode="require")
+        conn.autocommit = True
+        _ensure_schema(conn)
+        return conn
     else:
-        # Safe fallback to SQLite for local runs without secrets
         import sqlite3
         conn = sqlite3.connect("cordova_publication.db", check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
+        _ensure_schema(conn)
         return conn
-        
+
+def _exec(sql: str, args: tuple = ()):
+    conn = get_conn()
+    sql2 = _adapt_sql(sql, conn)
+    cur = conn.cursor()
+    cur.execute(sql2, args)
+    # Auto-commit for SQLite if DML (Postgres autocommit already True)
+    if not _is_postgres_conn(conn) and _is_dml(sql):
+        conn.commit()
+    return cur
+
+def _fetchall_dict(sql: str, args: tuple = ()) -> List[Dict[str, Any]]:
+    conn = get_conn()
+    sql2 = _adapt_sql(sql, conn)
+    cur = conn.cursor()
+    cur.execute(sql2, args)
+    rows = cur.fetchall()
+    cols = [d[0] for d in cur.description]
+    cur.close()
+    return [dict(zip(cols, r)) for r in rows]
+
+def _fetchone_val(sql: str, args: tuple = ()):
+    conn = get_conn()
+    sql2 = _adapt_sql(sql, conn)
+    cur = conn.cursor()
+    cur.execute(sql2, args)
+    row = cur.fetchone()
+    cur.close()
+    if row is None:
+        return None
+    if isinstance(row, (list, tuple)) and len(row) == 1:
+        return row[0]
+    return row
 
 def _ensure_schema(conn) -> None:
-    """Create required tables/indexes if missing."""
-    with conn.cursor() as cur:
+    """Create required tables/indexes if missing for Postgres or SQLite."""
+    pg = _is_postgres_conn(conn)
+    cur = conn.cursor()
+    if pg:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS bookings (
                 id SERIAL PRIMARY KEY,
@@ -125,30 +161,63 @@ def _ensure_schema(conn) -> None:
                 error TEXT
             );
         """)
+        cur.execute("""CREATE INDEX IF NOT EXISTS idx_bookings_date_slot
+                       ON bookings(date, slot);""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS idx_unavail_teacher_date
+                       ON teacher_unavailability(teacher, date);""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS idx_email_ts
+                       ON email_events(ts);""")
+    else:
+        # SQLite types are permissive; use AUTOINCREMENT for id and TEXT for dates
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_bookings_date_slot
-            ON bookings(date, slot);
+            CREATE TABLE IF NOT EXISTS bookings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                booking_type TEXT,
+                school_name TEXT,
+                title_used TEXT,
+                grade TEXT,
+                curriculum TEXT,
+                subject TEXT,
+                date TEXT,
+                slot TEXT,
+                topic TEXT,
+                salesperson_name TEXT,
+                salesperson_number TEXT,
+                salesperson_email TEXT,
+                teacher TEXT,
+                timestamp TEXT
+            );
         """)
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_unavail_teacher_date
-            ON teacher_unavailability(teacher, date);
+            CREATE TABLE IF NOT EXISTS teacher_unavailability (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacher TEXT NOT NULL,
+                date TEXT NOT NULL,
+                slot TEXT
+            );
         """)
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_email_ts
-            ON email_events(ts);
+            CREATE TABLE IF NOT EXISTS email_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                to_addr TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT
+            );
         """)
-
-def _exec(q: str, args: tuple = ()):
-    """Execute and return an open cursor (callers may fetch)."""
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(q, args)
-    return cur
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_bookings_date_slot ON bookings(date, slot);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_unavail_teacher_date ON teacher_unavailability(teacher, date);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_email_ts ON email_events(ts);")
+        conn.commit()
+    cur.close()
 
 
 # -----------------------------------------------------------------------------
 # Capacity configuration
 # -----------------------------------------------------------------------------
+from teacher_mapping import candidates_for_subject
+
 DEFAULT_MAX_PER_TEACHER = int(st.secrets.get("MAX_CLASSES_PER_TEACHER_PER_DAY", 2))
 MAX_PARALLEL_CLASSES_PER_SLOT = int(st.secrets.get("MAX_PARALLEL_CLASSES_PER_SLOT", 3))
 
@@ -157,12 +226,6 @@ def _norm_key(name: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "_", name).strip("_")
 
 def _per_teacher_limits() -> dict:
-    """
-    Optional overrides in secrets:
-      [PER_TEACHER_LIMITS]
-      MEGHA = "1"
-      VIVEK_SIR = "2"
-    """
     raw = st.secrets.get("PER_TEACHER_LIMITS", {})
     limits: dict[str, int] = {}
     for k, v in raw.items():
@@ -170,7 +233,7 @@ def _per_teacher_limits() -> dict:
             limits[_norm_key(k)] = int(v)
         except Exception:
             pass
-    limits.setdefault("MEGHA", 1)  # Hard rule: Megha = 1/day unless overridden
+    limits.setdefault("MEGHA", 1)  # Hard rule unless overridden
     return limits
 
 @st.cache_data(show_spinner=False, ttl=60)
@@ -179,49 +242,43 @@ def daily_limit_for_teacher(teacher: str) -> int:
 
 
 # -----------------------------------------------------------------------------
-# Availability & guards (Postgres syntax: %s placeholders)
+# Availability & guards
 # -----------------------------------------------------------------------------
 def is_teacher_unavailable(teacher: str, day: str, slot: str) -> bool:
-    cur = _exec(
+    cnt = _fetchone_val(
         """SELECT COUNT(*) FROM teacher_unavailability
            WHERE teacher=%s AND date=%s AND (slot IS NULL OR slot=%s)""",
         (teacher, day, slot),
-    )
-    cnt = cur.fetchone()[0]; cur.close()
-    return cnt > 0
+    ) or 0
+    return int(cnt) > 0
 
 def teacher_busy(teacher: str, day: str, slot: str) -> bool:
-    cur = _exec(
+    row = _fetchone_val(
         "SELECT 1 FROM bookings WHERE teacher=%s AND date=%s AND slot=%s LIMIT 1",
         (teacher, day, slot),
     )
-    row = cur.fetchone(); cur.close()
     return row is not None
 
 def exists_booking(school: str, subject: str, day: str, slot: str) -> bool:
-    cur = _exec(
+    row = _fetchone_val(
         "SELECT 1 FROM bookings WHERE school_name=%s AND subject=%s AND date=%s AND slot=%s LIMIT 1",
         (school, subject, day, slot),
     )
-    row = cur.fetchone(); cur.close()
     return row is not None
 
 def count_teacher_on_day(teacher: str, day: str) -> int:
-    cur = _exec("SELECT COUNT(*) FROM bookings WHERE teacher=%s AND date=%s", (teacher, day))
-    cnt = int(cur.fetchone()[0]); cur.close()
-    return cnt
+    cnt = _fetchone_val("SELECT COUNT(*) FROM bookings WHERE teacher=%s AND date=%s", (teacher, day)) or 0
+    return int(cnt)
 
 def count_parallel_on_slot(day: str, slot: str) -> int:
-    cur = _exec("SELECT COUNT(*) FROM bookings WHERE date=%s AND slot=%s", (day, slot))
-    cnt = int(cur.fetchone()[0]); cur.close()
-    return cnt
+    cnt = _fetchone_val("SELECT COUNT(*) FROM bookings WHERE date=%s AND slot=%s", (day, slot)) or 0
+    return int(cnt)
 
 
 # -----------------------------------------------------------------------------
 # Teacher choice (availability + caps)
 # -----------------------------------------------------------------------------
 def pick_teacher(subject: str, day: str, slot: str) -> Optional[str]:
-    """First candidate who is available, not busy, and under daily limit."""
     for t in candidates_for_subject(subject):
         if is_teacher_unavailable(t, day, slot):
             continue
@@ -234,53 +291,41 @@ def pick_teacher(subject: str, day: str, slot: str) -> Optional[str]:
 
 
 # -----------------------------------------------------------------------------
-# Bookings CRUD (rules enforced here)
+# Booking rules + CRUD
 # -----------------------------------------------------------------------------
 def _enforce_booking_window(day_str: str, slot_str: str) -> Tuple[bool, str]:
-    """
-    Enforce:
-      - No same-day (or past) bookings
-      - Booking for 'tomorrow' only before 14:00 local time
-    """
     local_now = now_local()
     today = local_now.date()
     session_date = parse_session_date(day_str)
 
+    # Must be strictly after today
     if session_date <= today:
         return False, "❌ Sessions must be booked at least one day in advance."
-
+    # Tomorrow allowed only before 2 PM today
     if session_date == today + timedelta(days=1) and local_now.time() >= time(14, 0):
         return False, "❌ You can only book for tomorrow before 02:00 PM."
-
     return True, ""
 
 def record_booking(data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]]:
-    """
-    Insert booking after guard checks (including booking window rules).
-    Returns (ok, message, booking_id|None).
-    """
     day   = data["date"]
     slot  = data["slot"]
     subj  = data["subject"]
     school = data["school_name"]
     teacher = data["teacher"]
 
-    # Booking window
     ok, msg = _enforce_booking_window(day, slot)
     if not ok:
         return False, msg, None
 
-    # Parallel cap
     if count_parallel_on_slot(day, slot) >= MAX_PARALLEL_CLASSES_PER_SLOT:
         return False, "This slot is full. Please choose another time.", None
 
-    # Duplicate guard
     if exists_booking(school, subj, day, slot):
         return False, "This school & subject is already booked for that date & slot.", None
 
-    # Teacher slot & daily cap
     if is_teacher_unavailable(teacher, day, slot) or teacher_busy(teacher, day, slot):
         return False, "Selected teacher is not available in this slot.", None
+
     if count_teacher_on_day(teacher, day) >= daily_limit_for_teacher(teacher):
         return False, f"{teacher} has reached the daily limit ({daily_limit_for_teacher(teacher)}).", None
 
@@ -291,8 +336,7 @@ def record_booking(data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]]:
             booking_type, school_name, title_used, grade, curriculum, subject,
             date, slot, topic, salesperson_name, salesperson_number,
             salesperson_email, teacher, timestamp
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        RETURNING id""",
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
         (
             data["booking_type"], data["school_name"], data.get("title_used"),
             data.get("grade"), data.get("curriculum"), data["subject"],
@@ -301,57 +345,58 @@ def record_booking(data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]]:
             data["salesperson_email"], teacher, booked_ts,
         ),
     )
-    new_id = cur.fetchone()[0]; cur.close()
+    # Return ID in a portable way
+    new_id = None
+    try:
+        # Postgres: RETURNING id (not used here to remain portable)
+        new_id = _fetchone_val("SELECT MAX(id) FROM bookings")
+    except Exception:
+        pass
+    cur.close()
     get_all_bookings.clear(); get_bookings_for_salesperson.clear()
-    return True, "Booking successfully created.", new_id
+    return True, "Booking successfully created.", int(new_id) if new_id else None
 
 @st.cache_data(show_spinner=False, ttl=60)
 def get_bookings_for_salesperson(email: str) -> List[Dict[str, Any]]:
-    conn = get_conn()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            """SELECT booking_type AS "Type",
-                      school_name  AS "School",
-                      subject      AS "Subject",
-                      date         AS "Date",
-                      slot         AS "Slot",
-                      topic        AS "Topic",
-                      teacher      AS "Teacher",
-                      timestamp    AS "Booked On"
-               FROM bookings
-               WHERE salesperson_email=%s
-               ORDER BY date DESC, timestamp DESC""",
-            (email,),
-        )
-        return cur.fetchall()
+    sql = """
+    SELECT booking_type AS "Type",
+           school_name  AS "School",
+           subject      AS "Subject",
+           date         AS "Date",
+           slot         AS "Slot",
+           topic        AS "Topic",
+           teacher      AS "Teacher",
+           timestamp    AS "Booked On"
+    FROM bookings
+    WHERE salesperson_email=%s
+    ORDER BY date DESC, timestamp DESC
+    """
+    return _fetchall_dict(sql, (email,))
 
 @st.cache_data(show_spinner=False, ttl=60)
 def get_all_bookings() -> List[Dict[str, Any]]:
-    conn = get_conn()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            """SELECT id                                   AS "id",
-                      booking_type                           AS "Type",
-                      school_name                            AS "School",
-                      title_used                             AS "Title Used",
-                      grade                                  AS "Grade",
-                      curriculum                             AS "Curriculum",
-                      subject                                AS "Subject",
-                      date                                   AS "Date",
-                      slot                                   AS "Slot",
-                      topic                                  AS "Topic",
-                      teacher                                AS "Teacher",
-                      salesperson_name                       AS "Salesperson",
-                      salesperson_number                     AS "Salesperson Number",
-                      salesperson_email                      AS "Salesperson Email",
-                      timestamp                              AS "Booked On"
-               FROM bookings
-               ORDER BY date DESC, timestamp DESC"""
-        )
-        return cur.fetchall()
+    sql = """
+    SELECT id                                   AS "id",
+           booking_type                          AS "Type",
+           school_name                           AS "School",
+           title_used                            AS "Title Used",
+           grade                                 AS "Grade",
+           curriculum                            AS "Curriculum",
+           subject                               AS "Subject",
+           date                                  AS "Date",
+           slot                                  AS "Slot",
+           topic                                 AS "Topic",
+           teacher                               AS "Teacher",
+           salesperson_name                      AS "Salesperson",
+           salesperson_number                    AS "Salesperson Number",
+           salesperson_email                     AS "Salesperson Email",
+           timestamp                             AS "Booked On"
+    FROM bookings
+    ORDER BY date DESC, timestamp DESC
+    """
+    return _fetchall_dict(sql)
 
 def delete_booking(booking_id_or_row) -> None:
-    """Delete by id or by strict match for legacy callers."""
     if isinstance(booking_id_or_row, int):
         _exec("DELETE FROM bookings WHERE id=%s", (booking_id_or_row,))
     elif isinstance(booking_id_or_row, dict) and "id" in booking_id_or_row:
@@ -419,13 +464,11 @@ def attempt_booking(form_data: Dict[str, Any]) -> Tuple[bool, str, Optional[int]
 def _elog(msg: str): print(f"[EMAIL] {msg}")
 
 def get_teacher_email(teacher: str) -> str:
-    """Look up teacher email from [TEACHER_EMAILS] using a normalized key."""
     book = st.secrets.get("TEACHER_EMAILS", {})
     if not teacher:
         _elog("teacher email lookup skipped: empty teacher"); return ""
     key_norm = _norm_key(teacher)
     val = book.get(key_norm)
-
     if not val:
         alt_keys = {
             key_norm.replace("MAAM", "MAM"),
@@ -451,7 +494,6 @@ def _log_email(to_addr: str, subject: str, status: str, error: str | None = None
     )
 
 def _smtp_send(to_addr: str, subject: str, body: str) -> None:
-    """UTF-8 safe SMTP with 1 retry + DB logging."""
     if not to_addr:
         _elog("skip: empty to_addr"); return
 
@@ -499,7 +541,6 @@ def get_mail_executor() -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=4)
 
 def _email_sync_mode() -> bool:
-    # Default ON for reliability; set EMAIL_SYNC="false" to queue async
     return str(st.secrets.get("EMAIL_SYNC", "true")).lower() == "true"
 
 def _send_async(to_addr: str, subject: str, body: str):
@@ -544,7 +585,6 @@ def send_confirmation_emails(booking: Dict[str, Any]) -> None:
             f"Salesperson: {sp_name}\nSalesperson Email: {sp_email}\n")
 
 def send_cancellation_emails(booking: Dict[str, Any]) -> None:
-    """Send cancellation emails synchronously to avoid losing them on rerun."""
     def g(CAPS: str, form: str) -> Any:
         return booking.get(CAPS) if CAPS in booking else booking.get(form)
 
@@ -563,7 +603,6 @@ def send_cancellation_emails(booking: Dict[str, Any]) -> None:
         f"Dear {sp_name},\n\nYour scheduled class has been cancelled.\n\n"
         f"School: {school}\nGrade: {grade}\nSubject: {subj}\nDate: {day}\nSlot: {slot}\n"
     )
-
     t_email = get_teacher_email(teacher)
     if t_email:
         _smtp_send(
@@ -579,20 +618,26 @@ def send_cancellation_emails(booking: Dict[str, Any]) -> None:
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=60)
 def get_email_events(limit: int = 200):
-    conn = get_conn()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute(
-            "SELECT id, ts, to_addr AS to, subject, status, error FROM email_events ORDER BY id DESC LIMIT %s",
-            (limit,),
-        )
-        return cur.fetchall()
+    sql = """SELECT id,
+                    ts,
+                    to_addr AS "to",
+                    subject,
+                    status,
+                    error
+             FROM email_events
+             ORDER BY id DESC
+             LIMIT %s"""
+    return _fetchall_dict(sql, (limit,))
 
 def resend_email(event_id: int):
-    cur = _exec("SELECT to_addr, subject FROM email_events WHERE id=%s", (event_id,))
-    row = cur.fetchone(); cur.close()
+    row = _fetchone_val("SELECT to_addr, subject FROM email_events WHERE id=%s", (event_id,))
     if not row:
         return
-    to_addr, subject = row
+    # row could be tuple or dict depending on engine; handle both
+    if isinstance(row, dict):
+        to_addr, subject = row["to_addr"], row["subject"]
+    else:
+        to_addr, subject = row
     _smtp_send(to_addr, subject, f"[RESEND] This is a resend attempt for '{subject}'.")
 
 
@@ -604,10 +649,8 @@ def mark_unavailable(teacher: str, day: str, slot: Optional[str]) -> None:
           (teacher, day, slot))
 
 def list_unavailability() -> List[Dict[str, Any]]:
-    conn = get_conn()
-    with conn.cursor(cursor_factory=RealDictCursor) as cur:
-        cur.execute("SELECT id, teacher AS \"Teacher\", date AS \"Date\", slot AS \"Slot\" FROM teacher_unavailability ORDER BY date DESC")
-        return cur.fetchall()
+    sql = 'SELECT id, teacher AS "Teacher", date AS "Date", slot AS "Slot" FROM teacher_unavailability ORDER BY date DESC'
+    return _fetchall_dict(sql)
 
 def delete_unavailability(unavail_id: int) -> None:
     _exec("DELETE FROM teacher_unavailability WHERE id=%s", (unavail_id,))
@@ -620,7 +663,6 @@ def get_teacher_unavailability():
     return list_unavailability()
 
 def delete_teacher_unavailability(teacher_or_id, day=None, slot=None):
-    """Accept either an id or (teacher, date, slot) triple for old admin dashboards."""
     if isinstance(teacher_or_id, int):
         return delete_unavailability(teacher_or_id)
     if teacher_or_id and day:
@@ -630,4 +672,3 @@ def delete_teacher_unavailability(teacher_or_id, day=None, slot=None):
         else:
             _exec("DELETE FROM teacher_unavailability WHERE teacher=%s AND date=%s AND slot IS NULL",
                   (teacher_or_id, day))
-
